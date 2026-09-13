@@ -1,0 +1,31 @@
+name: Local Harness Devstral
+version: 1.0.0
+schema: v1
+
+models:
+  - name: Local Harness Devstral
+    provider: openai
+    model: devstral
+    apiBase: http://127.0.0.1:8000/v1
+    apiKey: local
+    roles:
+      - chat
+      - edit
+      - apply
+    contextLength: 90000
+    defaultCompletionOptions:
+      temperature: 0.2
+      maxTokens: 4096
+
+context:
+  - provider: code
+  - provider: diff
+  - provider: terminal
+  - provider: problems
+  - provider: folder
+
+rules:
+  - Keep requests narrow. Prefer explicitly selected files and current editor context.
+  - Treat the upstream model as stateless. Important project facts belong in harness project memory.
+  - Do not paste huge files unless the user asks; ask for a specific file or symbol instead.
+

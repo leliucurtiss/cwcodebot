@@ -1,0 +1,27 @@
+server:
+  host: 127.0.0.1
+  port: 8000
+
+maas:
+  # OpenAI-compatible endpoint root, for example:
+  # https://your-devstral-host.example.com/v1
+  base_url: http://127.0.0.1:4000/v1
+  api_key: ${DEVSTRAL_API_KEY}
+  default_model: ${DEVSTRAL_MODEL:-devstral}
+  timeout_seconds: 300
+
+context:
+  model_context_max: 128000
+  safe_input_budget: 90000
+  output_reserve: 16000
+  token_char_ratio: 3.0
+  token_safety_multiplier: 1.25
+  max_file_bytes: 120000
+
+workspace:
+  # Set this to the local code project you want Continue to work on.
+  # The ./raw folder under this root is intended for original PDFs and Word docs.
+  root: .
+
+storage:
+  sqlite_path: ./data/harness.db
