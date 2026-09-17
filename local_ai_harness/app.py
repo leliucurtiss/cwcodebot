@@ -24,6 +24,26 @@ from .session import SessionManager
 from .storage import Storage
 from .workspace import WorkspaceReader
 
+# Example function for printing messages
+def print_messages(messages, label):
+    total_char_size = 0
+    for i, message in enumerate(messages):
+        # Handle the case where content is a list or string
+        if isinstance(message.content, str):
+            message_size = len(message.content)
+        elif isinstance(message.content, list):
+            message_size = sum(len(str(item)) for item in message.content)
+        else:
+            message_size = 0
+
+        total_char_size += message_size
+
+        # Print message with newline handling
+        print(f"{label} {i+1}: (Size: {message_size} chars)\n{message}\n")
+
+    # Print total character size
+    print(f"Total {label}s: {len(messages)}")
+    print(f"Total character size: {total_char_size} chars\n")
 
 def create_app(config_path: str | None = None, config: AppConfig | None = None, gateway: MaasGateway | None = None) -> FastAPI:
     cfg = config or load_config(config_path)
@@ -62,11 +82,21 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         x_harness_project_id: str | None = Header(default=None),
         x_harness_conversation_id: str | None = Header(default=None),
     ) -> Any:
+        # print(f" !!!!! Model: {req.model or cfg.maas.default_model}")
+
+        # Print the messages and their length
+        print_messages(req.messages,"request")
+
         session = session_manager.resolve(x_harness_project_id, x_harness_conversation_id)
         memory = memory_manager.load(session.project, session.conversation)
         stored = storage.list_messages(session.conversation.id)
         context_files = req.context_files or []
-        built = context_builder.build(session.project, memory, stored, req.messages, context_files)
+
+        try:
+            built = context_builder.build(session.project, memory, stored, req.messages, context_files)
+        except ValueError as e:
+            print(f"Context building error: {e}")
+            raise
 
         for msg in req.messages:
             if msg.role in {"user", "assistant"}:
@@ -79,13 +109,39 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
         if req.stream:
             async def stream() -> Any:
+                first_chunk = True
+                accumulated_data = ""
                 async for chunk in maas.stream_chat_completion(payload):
+                    # Decode the bytes and strip any "data: " prefix
+                    chunk_str = chunk.decode('utf-8').strip()
+                    if chunk_str.startswith("data: "):
+                        chunk_str = chunk_str[6:]  # Remove "data: " prefix
+
+                    accumulated_data += chunk_str
+
+                    # Check if we have a complete JSON object
+                    try:
+                        chunk_json = json.loads(accumulated_data)
+                        if first_chunk:
+                            print(f"Streaming chunk: {chunk_json}")  # Print the full message once
+                            first_chunk = False
+                        else:
+                            print(f"{chunk_json.get('choices')[0].get('delta', {}).get('content', '')}",end="")  
+                            # Print only the content, without the \n
+
+                        # Reset accumulated data after successful parse
+                        accumulated_data = ""
+                    except json.JSONDecodeError:
+                        # If we have an incomplete JSON, continue accumulating
+                        pass
+
                     yield chunk
                 storage.add_message(session.conversation.id, "assistant", "[streamed response not captured by MVP]")
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         response = await maas.chat_completion(payload)
+        print(f"Response: {response}")  # Print the non-streaming response
         assistant_text = _extract_assistant_text(response)
         if assistant_text:
             storage.add_message(session.conversation.id, "assistant", assistant_text)
@@ -150,7 +206,6 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         }
 
     return app
-
 
 def _extract_assistant_text(response: dict[str, Any]) -> str:
     try:

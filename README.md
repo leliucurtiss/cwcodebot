@@ -5,7 +5,8 @@ Minimal local-first OpenAI-compatible harness for VS Code Continue.
 Continue talks to this local server:
 
 ```text
-http://127.0.0.1:8000/v1
+For local: http://127.0.0.1:8000/v1
+For LAN:   http://serverip:8000/v1
 ```
 
 The harness rebuilds a bounded prompt for every request, stores project memory locally, and forwards each request to a stateless OpenAI-compatible Devstral MaaS endpoint.
@@ -41,7 +42,8 @@ Use `continue/config.yaml.template` as the Continue config starting point.
 Set Continue's model API base to:
 
 ```text
-http://127.0.0.1:8000/v1
+http://127.0.0.1:8000/v1 
+http://serverip:8000/v1
 ```
 
 Use any placeholder API key for Continue, for example `local`, because the harness owns the MaaS key.

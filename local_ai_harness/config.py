@@ -8,7 +8,6 @@ from typing import Any
 
 import yaml
 
-
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
 
@@ -26,12 +25,10 @@ def _expand_env(value: Any) -> Any:
         return [_expand_env(v) for v in value]
     return value
 
-
 @dataclass(frozen=True)
 class ServerConfig:
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8000
-
 
 @dataclass(frozen=True)
 class MaasConfig:
@@ -40,26 +37,23 @@ class MaasConfig:
     default_model: str = "devstral"
     timeout_seconds: float = 300.0
 
-
 @dataclass(frozen=True)
 class ContextConfig:
     model_context_max: int = 128000
-    safe_input_budget: int = 90000
-    output_reserve: int = 16000
+    safe_input_budget: int = 1280000
+    output_reserve: int = 160000
     token_char_ratio: float = 3.0
     token_safety_multiplier: float = 1.25
     max_file_bytes: int = 120000
-
+    max_compressed_length: int = 10000  # Add this line to include the new attribute
 
 @dataclass(frozen=True)
 class WorkspaceConfig:
     root: Path
 
-
 @dataclass(frozen=True)
 class StorageConfig:
     sqlite_path: Path
-
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -105,11 +99,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         context=ContextConfig(
             model_context_max=int(context.get("model_context_max", 128000)),
-            safe_input_budget=int(context.get("safe_input_budget", 90000)),
-            output_reserve=int(context.get("output_reserve", 16000)),
+            safe_input_budget=int(context.get("safe_input_budget", 1280000)),
+            output_reserve=int(context.get("output_reserve", 160000)),
             token_char_ratio=float(context.get("token_char_ratio", 3.0)),
             token_safety_multiplier=float(context.get("token_safety_multiplier", 1.25)),
             max_file_bytes=int(context.get("max_file_bytes", 120000)),
+            max_compressed_length=int(context.get("max_compressed_length", 10000)),  # Add this line to include the new attribute
         ),
         workspace=WorkspaceConfig(
             root=Path(workspace.get("root", ".")).expanduser().resolve(),
@@ -118,4 +113,3 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             sqlite_path=Path(storage.get("sqlite_path", "./data/harness.db")).expanduser(),
         ),
     )
-

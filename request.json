@@ -1,0 +1,7 @@
+{
+  "model": "devstral",
+  "messages": [
+    {"role": "user", "content": "Hello, how can you help me?"},
+    {"role": "assistant", "content": "I can assist with various tasks."}
+  ]
+}

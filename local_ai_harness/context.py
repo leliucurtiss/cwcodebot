@@ -17,14 +17,12 @@ def message_content_to_text(content: Any) -> str:
         return content
     return str(content)
 
-
 @dataclass
 class ContextBuildResult:
     messages: list[dict[str, str]]
     estimated_tokens: int
     discarded: list[str] = field(default_factory=list)
     token_breakdown: dict[str, int] = field(default_factory=dict)
-
 
 class ContextBuilder:
     def __init__(self, config: ContextConfig, workspace: WorkspaceReader):
@@ -39,6 +37,14 @@ class ContextBuilder:
 
     def _message_tokens(self, message: dict[str, str]) -> int:
         return self.estimate_tokens(message.get("role", "")) + self.estimate_tokens(message.get("content", ""))
+
+    def compress_context(self, content: str) -> str:
+        # Implement your compression logic here
+        # For example, you can truncate the content or use a summarization technique
+        max_length = self.config.max_compressed_length
+        if len(content) > max_length:
+            return content[:max_length] + "..."
+        return content
 
     def build(
         self,
@@ -62,7 +68,18 @@ class ContextBuilder:
                 discarded.append(label)
                 return False
             if required and used + cost > budget:
-                raise ValueError(f"Required context section exceeds safe budget: {label}")
+                # Compress the context instead of raising an error
+                compressed_content = self.compress_context(content)
+                msg = {"role": role, "content": compressed_content}
+                cost = self._message_tokens(msg)
+                if used + cost <= budget:
+                    result.append(msg)
+                    used += cost
+                    breakdown[label] = breakdown.get(label, 0) + cost
+                    return True
+                else:
+                    discarded.append(label)
+                    return False
             result.append(msg)
             used += cost
             breakdown[label] = breakdown.get(label, 0) + cost
@@ -123,6 +140,5 @@ class ContextBuilder:
             discarded=discarded,
             token_breakdown=breakdown,
         )
-
 
 ContextPacker = ContextBuilder

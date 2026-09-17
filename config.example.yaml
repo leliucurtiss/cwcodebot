@@ -12,8 +12,8 @@ maas:
 
 context:
   model_context_max: 128000
-  safe_input_budget: 90000
-  output_reserve: 16000
+  safe_input_budget: 128000
+  output_reserve: 160000
   token_char_ratio: 3.0
   token_safety_multiplier: 1.25
   max_file_bytes: 120000

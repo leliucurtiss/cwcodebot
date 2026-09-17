@@ -16,7 +16,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str | None = None
     messages: list[ChatMessage]
-    stream: bool = False
+    stream: bool = True
     temperature: float | None = None
     max_tokens: int | None = None
     context_files: list[str] = Field(default_factory=list)
