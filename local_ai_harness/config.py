@@ -40,12 +40,12 @@ class MaasConfig:
 @dataclass(frozen=True)
 class ContextConfig:
     model_context_max: int = 128000
-    safe_input_budget: int = 1280000
+    safe_input_budget: int = 128000
     output_reserve: int = 160000
     token_char_ratio: float = 3.0
     token_safety_multiplier: float = 1.25
     max_file_bytes: int = 120000
-    max_compressed_length: int = 10000  # Add this line to include the new attribute
+    max_compressed_length: int = 100000  # Add this line to include the new attribute
 
 @dataclass(frozen=True)
 class WorkspaceConfig:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+from collections import OrderedDict
 
 from .config import ContextConfig
 from .memory import HierarchicalMemory
@@ -23,6 +24,25 @@ class ContextBuildResult:
     estimated_tokens: int
     discarded: list[str] = field(default_factory=list)
     token_breakdown: dict[str, int] = field(default_factory=dict)
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cache = OrderedDict()
+        self.capacity = capacity
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        else:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+
+    def put(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        if len(self.cache) > self.capacity:
+            self.cache.popitem(last=False)
 
 class ContextBuilder:
     def __init__(self, config: ContextConfig, workspace: WorkspaceReader):
@@ -60,6 +80,9 @@ class ContextBuilder:
         breakdown: dict[str, int] = {}
         used = 0
 
+        # Initialize LRU cache for messages
+        lru_cache = LRUCache(budget)
+
         def add(label: str, role: str, content: str, required: bool = False) -> bool:
             nonlocal used
             msg = {"role": role, "content": content}
@@ -86,9 +109,8 @@ class ContextBuilder:
             return True
 
         system = (
-            "You are a software engineering assistant working on a local project.\n"
-            "Use only the supplied project memory, conversation, and file context.\n"
-            "When information is missing, say which file or detail is needed.\n\n"
+            "You are a software engineering assistant.\n"
+            "When information is missing, call tools to read file to get detail needed.\n\n"
             f"{(memory or HierarchicalMemory(project.memory_summary, '')).render()}"
         )
         add("system", "system", system, required=True)
