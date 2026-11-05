@@ -41,7 +41,7 @@ class MaasConfig:
 class ContextConfig:
     model_context_max: int = 128000
     safe_input_budget: int = 128000
-    output_reserve: int = 160000
+    output_reserve: int = 16000
     token_char_ratio: float = 3.0
     token_safety_multiplier: float = 1.25
     max_file_bytes: int = 120000
@@ -99,8 +99,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         context=ContextConfig(
             model_context_max=int(context.get("model_context_max", 128000)),
-            safe_input_budget=int(context.get("safe_input_budget", 1280000)),
-            output_reserve=int(context.get("output_reserve", 160000)),
+            safe_input_budget=int(context.get("safe_input_budget", 128000)),
+            output_reserve=int(context.get("output_reserve", 16000)),
             token_char_ratio=float(context.get("token_char_ratio", 3.0)),
             token_safety_multiplier=float(context.get("token_safety_multiplier", 1.25)),
             max_file_bytes=int(context.get("max_file_bytes", 120000)),

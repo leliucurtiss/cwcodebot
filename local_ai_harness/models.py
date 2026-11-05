@@ -25,6 +25,18 @@ class ChatCompletionRequest(BaseModel):
         extra = "allow"
 
 
+class CompletionRequest(BaseModel):
+    model: str | None = None
+    prompt: str
+    stream: bool = False
+    temperature: float | None = None
+    max_tokens: int | None = None
+    stop: str | list[str] | None = None
+
+    class Config:
+        extra = "allow"
+
+
 class ProjectCreateRequest(BaseModel):
     project_id: str | None = None
     root_path: str | None = None

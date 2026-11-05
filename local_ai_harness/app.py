@@ -14,6 +14,7 @@ from .gateway import MaasGateway
 from .memory import MemoryManager
 from .models import (
     ChatCompletionRequest,
+    CompletionRequest,
     ConversationCreateRequest,
     ConversationMemoryUpdate,
     DebugContextRequest,
@@ -75,6 +76,48 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
         return await maas.list_models()
+
+    @app.post("/v1/completions")
+    async def completions(req: CompletionRequest) -> dict[str, Any]:
+        print(f"DEBUG: [Route] Received completion request: {req.prompt[:50]}...")
+        # Wrap the completion prompt into a chat request
+        # We use a system prompt to force the model into 'completion mode'
+        chat_payload = {
+            "model": req.model or cfg.maas.default_model,
+            "messages": [
+                {"role": "system", "content": "You are a code completion engine. Your task is to provide the immediate next tokens of code that logically follow the provided prompt. Do not explain, do not apologize, do not wrap in markdown blocks. Provide ONLY the code completion."},
+                {"role": "user", "content": req.prompt}
+            ],
+            "temperature": req.temperature if req.temperature is not None else 0.0,
+            "max_tokens": req.max_tokens,
+        }
+        
+        print(f"DEBUG: [Route] Calling MAAS chat_completion... Payload model: {chat_payload['model']}")
+        try:
+            response = await maas.chat_completion(chat_payload)
+            print(f"DEBUG: [Route] Received response from MAAS")
+        except Exception as e:
+            print(f"DEBUG: [Route] ERROR calling MAAS: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"MAAS Gateway Error: {str(e)}")
+        
+        # Extract the content
+        assistant_text = _extract_assistant_text(response)
+        
+        # Return in OpenAI completions format
+        return {
+            "id": f"cmpl-{uuid.uuid4().hex[:12]}",
+            "object": "text_completion",
+            "created": 0, # Simplified
+            "model": chat_payload["model"],
+            "choices": [
+                {
+                    "text": assistant_text,
+                    "index": 0,
+                    "logprobs": None,
+                    "finish_reason": "stop"
+                }
+            ]
+        }
 
     @app.post("/v1/chat/completions")
     async def chat_completions(
