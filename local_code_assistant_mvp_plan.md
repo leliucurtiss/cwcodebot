@@ -6,7 +6,7 @@ Build the smallest usable **local-first Code Assistant Harness** that sits betwe
 
 The MVP exists to validate one core idea:
 
-> A local Harness can own project context and persistent working memory, while the LLM inference servers remain stateless and replaceable.
+> A local Harness can own project context and persistent working memory, while the LLM inference servers remain stateless sessions
 
 The first implementation should be deliberately small and easy to delete, rewrite, or refactor.
 
@@ -18,7 +18,7 @@ The first implementation should be deliberately small and easy to delete, rewrit
 
 The MVP MUST provide only these capabilities:
 
-1. Accept chat/completion requests from VS Code clients through an OpenAI-compatible API.
+1. Accept v1/chat/completion and v1/completions requests from VS Code clients through an OpenAI-compatible API.
 2. Forward model requests to a configurable LAN MaaS endpoint such as LiteLLM, llama.cpp, vLLM, or another OpenAI-compatible service.
 3. Read files from one configured local workspace.
 4. Maintain minimal persistent project/session memory locally.

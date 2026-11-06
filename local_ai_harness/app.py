@@ -152,35 +152,49 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
         if req.stream:
             async def stream() -> Any:
-                first_chunk = True
-                accumulated_data = ""
+                thought_header_printed = False
+                buffer = ""
+                
                 async for chunk in maas.stream_chat_completion(payload):
-                    # Decode the bytes and strip any "data: " prefix
-                    chunk_str = chunk.decode('utf-8').strip()
-                    if chunk_str.startswith("data: "):
-                        chunk_str = chunk_str[6:]  # Remove "data: " prefix
-
-                    accumulated_data += chunk_str
-
-                    # Check if we have a complete JSON object
-                    try:
-                        chunk_json = json.loads(accumulated_data)
-                        if first_chunk:
-                            print(f"Streaming chunk: {chunk_json}")  # Print the full message once
-                            first_chunk = False
-                        else:
-                            print(f"{chunk_json.get('choices')[0].get('delta', {}).get('content', '')}",end="")  
-                            # Print only the content, without the \n
-
-                        # Reset accumulated data after successful parse
-                        accumulated_data = ""
-                    except json.JSONDecodeError:
-                        # If we have an incomplete JSON, continue accumulating
-                        pass
-
+                    # 1. ALWAYS yield the chunk first so the client receives the data
                     yield chunk
-                storage.add_message(session.conversation.id, "assistant", "[streamed response not captured by MVP]")
 
+                    # 2. Now handle the terminal printing for the developer
+                    # Decode and add to buffer
+                    buffer += chunk.decode('utf-8')
+                    
+                    # SSE events are separated by newlines
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
+                        
+                        if not line or line == "data: [DONE]":
+                            continue
+                        
+                        if line.startswith("data: "):
+                            data_str = line[6:].strip()
+                            try:
+                                chunk_json = json.loads(data_str)
+                                delta = chunk_json.get('choices', [{}])[0].get('delta', {})
+                                
+                                # 1. Handle Thinking/Reasoning content
+                                reasoning = delta.get('reasoning_content')
+                                if reasoning:
+                                    if not thought_header_printed:
+                                        print("\n--- Thinking ---", flush=True)
+                                        thought_header_printed = True
+                                    print(reasoning, end="", flush=True)
+                                    continue
+
+                                # 2. Handle Final Output content
+                                content = delta.get('content')
+                                if content:
+                                    print(content, end="", flush=True)
+                                    
+                            except json.JSONDecodeError:
+                                pass
+                return 
+            
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         response = await maas.chat_completion(payload)

@@ -44,7 +44,7 @@ class ContextConfig:
     output_reserve: int = 16000
     token_char_ratio: float = 3.0
     token_safety_multiplier: float = 1.25
-    max_file_bytes: int = 120000
+    max_file_bytes: int = 65536
     max_compressed_length: int = 100000  # Add this line to include the new attribute
 
 @dataclass(frozen=True)
