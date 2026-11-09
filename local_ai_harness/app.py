@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from flask import Flask, Response
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
@@ -77,9 +78,23 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     async def models() -> dict[str, Any]:
         return await maas.list_models()
 
+    @app.get("/v1/api/hello")
+    async def api_hello():
+        """Handshake endpoint for Claude Code / Anthropic compatibility check."""
+        return {"status": "ok"}
+
+    # HEAD handler
+    @app.head("/v1/api/hello")
+    async def api_hello_head():
+        """
+        HEAD request handler — returns only headers, no body.
+        """
+        # 200 OK with no body
+        return Response(status = 200)
+
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest) -> dict[str, Any]:
-        print(f"DEBUG: [Route] Received completion request: {req.prompt[:50]}...")
+        # print(f"DEBUG: [Route] Received completion request: {req.prompt[:100]}")
         # Wrap the completion prompt into a chat request
         # We use a system prompt to force the model into 'completion mode'
         chat_payload = {
@@ -95,13 +110,13 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         print(f"DEBUG: [Route] Calling MAAS chat_completion... Payload model: {chat_payload['model']}")
         try:
             response = await maas.chat_completion(chat_payload)
-            print(f"DEBUG: [Route] Received response from MAAS")
         except Exception as e:
             print(f"DEBUG: [Route] ERROR calling MAAS: {str(e)}")
             raise HTTPException(status_code=500, detail=f"MAAS Gateway Error: {str(e)}")
         
         # Extract the content
         assistant_text = _extract_assistant_text(response)
+        print(f"DEBUG: [Route] Received response from MAAS: {assistant_text[:100]}")
         
         # Return in OpenAI completions format
         return {
@@ -125,8 +140,6 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         x_harness_project_id: str | None = Header(default=None),
         x_harness_conversation_id: str | None = Header(default=None),
     ) -> Any:
-        # print(f" !!!!! Model: {req.model or cfg.maas.default_model}")
-
         # Print the messages and their length
         print_messages(req.messages,"request")
 
