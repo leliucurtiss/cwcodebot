@@ -107,16 +107,16 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             "max_tokens": req.max_tokens,
         }
         
-        print(f"DEBUG: [Route] Calling MAAS chat_completion... Payload model: {chat_payload['model']}")
+        print(f"INFO: [Route] Calling MAAS chat_completion... Payload model: {chat_payload['model']}")
         try:
             response = await maas.chat_completion(chat_payload)
         except Exception as e:
-            print(f"DEBUG: [Route] ERROR calling MAAS: {str(e)}")
+            print(f"ERROR: [Route] ERROR calling MAAS: {str(e)}")
             raise HTTPException(status_code=500, detail=f"MAAS Gateway Error: {str(e)}")
         
         # Extract the content
         assistant_text = _extract_assistant_text(response)
-        print(f"DEBUG: [Route] Received response from MAAS: {assistant_text[:100]}")
+        print(f"INFO: [Route] Received response from MAAS: {assistant_text[:100]}")
         
         # Return in OpenAI completions format
         return {
@@ -166,47 +166,109 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         if req.stream:
             async def stream() -> Any:
                 thought_header_printed = False
-                buffer = ""
-                
+                buffer = b""
+                pending_content = ""
+                text_tool_call = False
+
+                # Markers for tool detection
+                tool_markers = ["TOOL_NAME:", "```tool", "```json"]
+
                 async for chunk in maas.stream_chat_completion(payload):
-                    # 1. ALWAYS yield the chunk first so the client receives the data
-                    yield chunk
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        raw_line, buffer = buffer.split(b"\n", 1)
+                        line = raw_line.decode("utf-8").strip()
 
-                    # 2. Now handle the terminal printing for the developer
-                    # Decode and add to buffer
-                    buffer += chunk.decode('utf-8')
-                    
-                    # SSE events are separated by newlines
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        line = line.strip()
-                        
-                        if not line or line == "data: [DONE]":
+                        if not line or not line.startswith("data: "):
                             continue
-                        
-                        if line.startswith("data: "):
-                            data_str = line[6:].strip()
-                            try:
-                                chunk_json = json.loads(data_str)
-                                delta = chunk_json.get('choices', [{}])[0].get('delta', {})
-                                
-                                # 1. Handle Thinking/Reasoning content
-                                reasoning = delta.get('reasoning_content')
-                                if reasoning:
-                                    if not thought_header_printed:
-                                        print("\n--- Thinking ---", flush=True)
-                                        thought_header_printed = True
-                                    print(reasoning, end="", flush=True)
-                                    continue
 
-                                # 2. Handle Final Output content
-                                content = delta.get('content')
-                                if content:
+                        if line == "data: [DONE]":
+                            # Final Flush: Handle remaining buffer
+                            if text_tool_call:
+                                translated = _translate_tool_call(pending_content)
+                                if translated:
+                                    yield f"data: {translated}\n\n".encode("utf-8")
+                                elif pending_content:
+                                    yield _content_sse(pending_content)
+                            elif pending_content:
+                                yield _content_sse(pending_content)
+                            pending_content = ""
+                            text_tool_call = False
+                            yield raw_line + b"\n"
+                            continue
+
+                        try:
+                            chunk_json = json.loads(line[6:].strip())
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = chunk_json.get("choices", [])
+                        for choice in choices:
+                            delta = choice.get("delta", {})
+
+                            # 1. Handle Reasoning (Thinking)
+                            reasoning = delta.get("reasoning_content")
+                            if reasoning:
+                                yield _reason_sse(reasoning)
+                                if not thought_header_printed:
+                                    print("\n--- Thinking ---", flush=True)
+                                    thought_header_printed = True
+                                print(reasoning, end="", flush=True)
+
+                            # 2. Handle Native Tool Calls (Pass-through)
+                            tool_calls = delta.get("tool_calls")
+                            if tool_calls:
+                                yield _tool_calls_sse(tool_calls)
+
+                            # 2. Handle Content (and Text-to-Tool Translation)
+                            content = delta.get("content")
+                            if isinstance(content, str) and content:
+                                pending_content += content
+
+                                if not text_tool_call:
+                                    # Decision Logic: Is this a tool call or just text?
+                                    if any(pending_content.startswith(m) for m in tool_markers):
+                                        text_tool_call = True
+                                    elif not (pending_content.startswith('T') or pending_content.startswith('`')):
+                                        # Definitely not a marker, flush immediately
+                                        yield _content_sse(pending_content)
+                                        print(pending_content, end="", flush=True)
+                                        pending_content = ""
+                                    elif len(pending_content) > max(len(m) for m in tool_markers):
+                                        # Buffered enough to know it's not a marker
+                                        yield _content_sse(pending_content)
+                                        print(pending_content, end="", flush=True)
+                                        pending_content = ""
+                                else:
+                                    # We are in tool mode, just accumulate
                                     print(content, end="", flush=True)
-                                    
-                            except json.JSONDecodeError:
-                                pass
-                return 
+
+                            # 3. Handle Finish Reason
+                            if choice.get("finish_reason") is not None:
+                                if text_tool_call:
+                                    translated = _translate_tool_call(pending_content)
+                                    if translated:
+                                        yield f"data: {translated}\n\n".encode("utf-8")
+                                    elif pending_content:
+                                        yield _content_sse(pending_content)
+                                elif pending_content:
+                                    yield _content_sse(pending_content)
+
+                                yield f"data: {json.dumps({'choices': [{'finish_reason': choice.get('finish_reason')}]})}\n\n".encode("utf-8")
+                                pending_content = ""
+                                text_tool_call = False
+
+                # Final Cleanup for any trailing buffer
+                if pending_content:
+                    if text_tool_call:
+                        translated = _translate_tool_call(pending_content)
+                        if translated:
+                            yield f"data: {translated}\n\n".encode("utf-8")
+                        else:
+                            yield _content_sse(pending_content)
+                    else:
+                        yield _content_sse(pending_content)
+                return
             
             return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -286,3 +348,124 @@ def _extract_assistant_text(response: dict[str, Any]) -> str:
         return json.dumps(content, ensure_ascii=False)
     except Exception:
         return ""
+
+def _reason_sse(content: str) -> bytes:
+    event = {"choices": [{"delta": {"reasoning_content": content}}]}
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+def _content_sse(content: str) -> bytes:
+    event = {"choices": [{"delta": {"content": content}}]}
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+def _tool_calls_sse(tool_calls: Any) -> bytes:
+    print(f"INFO: native tool call",tool_calls)
+    event = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+
+def _translate_tool_call(raw_text: str) -> str | None:
+    """
+    Translates MaaS text format:
+    # 1st examp
+    ```
+    TOOL_NAME: read_file
+    BEGIN_ARG: filePath
+    "/path/to/file"
+    END_ARG
+    ```
+    # or 2nd example
+    ```
+    tool
+    {
+        "command": "file_glob_search",
+        "parameters": {
+            "pattern": "app.py"
+        }
+    }
+    ``` 
+    #3rd example 
+    ```tool```tool```tool```tool```tool```tool```tool{"command": "read_file","parameters": {"filepath": "local_ai_harness/app.py"}}```
+
+    """   
+# --- Strategy 1: Try to extract JSON (Handles Format 2 & 3) ---
+    print(f"WARNING: translating tool calls {raw_text}")
+    if any(m in raw_text for m in ["```tool", "```json"]) or raw_text.startswith("{"):
+        try:
+            # 1. Clean up the "stuttering" markers and markdown wraps
+            # Remove all leading occurrences of ```tool
+            json_content = raw_text
+            while json_content.startswith("```tool"):
+                json_content = json_content[len("```tool"):].lstrip()
+            
+            # Remove leading ``` if it's just a standard code block
+            if json_content.startswith("```"):
+                json_content = json_content[3:].lstrip()
+                
+            # Remove trailing ```
+            if json_content.endswith("```"):
+                json_content = json_content[:-3].rstrip()
+
+            # 2. Parse the JSON
+            data = json.loads(json_content)
+            
+            # The MaaS JSON format usually uses "command" and "parameters"
+            tool_name = data.get("command")
+            args = data.get("parameters", {})
+
+            if tool_name:
+                return _build_openai_tool_call(tool_name, args)
+        except (json.JSONDecodeError, AttributeError):
+            # If JSON parsing fails, we fall through to the legacy line-by-line parser
+            pass
+
+# --- Strategy 2: Line-by-Line Parsing (Handles Format 1) ---
+    tool_name = ""
+    args: dict[str, Any] = {}
+    current_arg_key: str | None = None
+    value_lines: list[str] = []
+
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TOOL_NAME:"):
+            tool_name = stripped.removeprefix("TOOL_NAME:").strip()
+        elif stripped.startswith("BEGIN_ARG:"):
+            if current_arg_key is not None:
+                return None
+            current_arg_key = stripped.removeprefix("BEGIN_ARG:").strip()
+            if not current_arg_key:
+                return None
+            value_lines = []
+        elif stripped == "END_ARG":
+            if current_arg_key is None:
+                return None
+            raw_value = "\n".join(value_lines).strip()
+            try:
+                args[current_arg_key] = json.loads(raw_value)
+            except json.JSONDecodeError:
+                args[current_arg_key] = raw_value.strip('"')
+            current_arg_key = None
+        elif current_arg_key is not None:
+            value_lines.append(line.strip())
+
+    if tool_name and not current_arg_key and args:
+        return _build_openai_tool_call(tool_name, args)
+
+    return None
+
+def _build_openai_tool_call(name: str, args: dict) -> str:
+    """Helper to wrap a tool name and args into the OpenAI SSE format."""
+    tool_call = {
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                }]
+            }
+        }]
+    }
+    return json.dumps(tool_call, ensure_ascii=False)

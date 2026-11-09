@@ -7,5 +7,6 @@ PORT="${HARNESS_PORT:-8000}"
 exec uvicorn local_ai_harness.app:create_app \
   --factory \
   --host "$HOST" \
-  --port "$PORT" 
+ --port "$PORT" > harness.log 2>&1
+  # --port "$PORT"
 
