@@ -210,10 +210,10 @@ The Harness MUST never intentionally fill the entire window.
 Initial configuration:
 
 ```text
-MODEL_CONTEXT_MAX       = 256000
-SAFE_INPUT_BUDGET       = 240000
-OUTPUT_RESERVE          = 32000
-SAFETY_MARGIN           = 240000
+MODEL_CONTEXT_MAX       = 128000
+SAFE_INPUT_BUDGET       = 120000
+OUTPUT_RESERVE          = 16000
+SAFETY_MARGIN           = 16000
 ```
 
 The exact values must be configuration parameters.
@@ -451,9 +451,9 @@ maas:
   timeout_seconds: 300
 
 context:
-  model_context_max: 256000
-  safe_input_budget: 240000
-  output_reserve: 32000
+  model_context_max: 128000
+  safe_input_budget: 120000
+  output_reserve: 16000
 
 workspace:
   root: /home/user/projects/demo

@@ -41,11 +41,11 @@ def print_messages(messages, label):
         total_char_size += message_size
 
         # Print message with newline handling
-        print(f"{label} {i+1}: (Size: {message_size} chars)\n{message}\n")
+        # print(f"{label} {i+1}: (Size: {message_size} chars)\n{message}\n")
 
     # Print total character size
-    print(f"Total {label}s: {len(messages)}")
-    print(f"Total character size: {total_char_size} chars\n")
+    # print(f"INFO: Total {label}s: {len(messages)}")
+    # print(f"INFO: Total character size: {total_char_size} chars\n")
 
 def create_app(config_path: str | None = None, config: AppConfig | None = None, gateway: MaasGateway | None = None) -> FastAPI:
     cfg = config or load_config(config_path)
