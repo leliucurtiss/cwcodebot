@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Any
 from collections import OrderedDict
@@ -63,7 +61,7 @@ class ContextBuilder:
         # For example, you can truncate the content or use a summarization technique
         max_length = self.config.max_compressed_length
         if len(content) > max_length:
-            return content[:max_length] + "..."
+            return content[:max_length]
         return content
 
     def build(
@@ -75,46 +73,78 @@ class ContextBuilder:
         context_files: list[str],
     ) -> ContextBuildResult:
         budget = self.config.safe_input_budget
-        result: list[dict[str, str]] = []
         discarded: list[str] = []
         breakdown: dict[str, int] = {}
         used = 0
 
-        # Initialize LRU cache for messages
-        lru_cache = LRUCache(budget)
+        # Separate buckets to maintain priority and eventual order
+        system_bucket: list[dict[str, str]] = []
+        incoming_bucket: list[dict[str, str]] = []
+        file_bucket: list[dict[str, str]] = []
+        history_bucket: list[dict[str, str]] = []
 
-        def add(label: str, role: str, content: str, required: bool = False) -> bool:
+        def add(bucket: list[dict[str, str]], label: str, role: str, content: str, required: bool = False) -> bool:
             nonlocal used
             msg = {"role": role, "content": content}
             cost = self._message_tokens(msg)
+            
             if not required and used + cost > budget:
                 discarded.append(label)
                 return False
+            
             if required and used + cost > budget:
                 # Compress the context instead of raising an error
                 compressed_content = self.compress_context(content)
                 msg = {"role": role, "content": compressed_content}
                 cost = self._message_tokens(msg)
                 if used + cost <= budget:
-                    result.append(msg)
+                    bucket.append(msg)
                     used += cost
                     breakdown[label] = breakdown.get(label, 0) + cost
                     return True
                 else:
                     discarded.append(label)
                     return False
-            result.append(msg)
+            
+            bucket.append(msg)
             used += cost
             breakdown[label] = breakdown.get(label, 0) + cost
             return True
 
-        system = (
+        # 1. System Prompt (Highest Priority)
+        system_text = (
             "You are a software engineering assistant.\n"
+            "Always try best to use OpenAI JSON tool call format.\n"
+            "Never apply files, use either edit or wait user to edit and/o apply.\n"
             "When information is missing, call tools to read file to get detail needed.\n\n"
             f"{(memory or HierarchicalMemory(project.memory_summary, '')).render()}"
         )
-        add("system", "system", system, required=True)
+        add(system_bucket, "system", "system", system_text, required=True)
 
+        # 2. Incoming Messages (High Priority - Current Turn)
+        incoming = [
+            {"role": msg.role, "content": message_content_to_text(msg.content)}
+            for msg in incoming_messages
+            if msg.role in {"system", "user", "assistant", "tool"}
+        ]
+        
+        # Identify the last user message to ensure it's required
+        latest_user_index = None
+        for i in range(len(incoming) - 1, -1, -1):
+            if incoming[i]["role"] == "user":
+                latest_user_index = i
+                break
+
+        for idx, msg in enumerate(incoming):
+            # All incoming messages are treated as required to avoid losing the current turn's context
+            is_required = (latest_user_index is not None and idx == latest_user_index) or True 
+            add(incoming_bucket, "incoming", msg["role"], msg["content"], required=is_required)
+
+        # Fallback if no user message was provided
+        if not any(m["role"] == "user" for m in incoming):
+            add(incoming_bucket, "incoming", "user", "", required=True)
+
+        # 3. Explicit Files (Medium Priority)
         file_context_parts: list[str] = []
         for rel in context_files:
             try:
@@ -123,42 +153,31 @@ class ContextBuilder:
                 file_context_parts.append(f"--- FILE: {rel}{marker} ---\n{text}")
             except WorkspaceError as exc:
                 discarded.append(f"file:{rel}:{exc}")
+        
         if file_context_parts:
-            add("explicit_files", "system", "\n\n".join(file_context_parts))
+            add(file_bucket, "explicit_files", "system", "\n\n".join(file_context_parts))
 
-        incoming = [
-            {"role": msg.role, "content": message_content_to_text(msg.content)}
-            for msg in incoming_messages
-            if msg.role in {"system", "user", "assistant", "tool"}
-        ]
-        latest_user_indexes = [i for i, msg in enumerate(incoming) if msg["role"] == "user"]
-        latest_user_index = latest_user_indexes[-1] if latest_user_indexes else None
-        latest_user = incoming[latest_user_index] if latest_user_index is not None else None
-
+        # 4. Recent History (Lowest Priority - fills remaining budget)
         history_candidates = [
             {"role": msg.role, "content": msg.content}
             for msg in stored_messages
             if msg.role in {"user", "assistant", "system", "tool"}
         ]
+        
+        # Add history from newest to oldest
         for msg in reversed(history_candidates):
-            if not add("recent_history", msg["role"], msg["content"]):
+            if not add(history_bucket, "recent_history", msg["role"], msg["content"]):
                 break
-        history_added = result[2:] if file_context_parts else result[1:]
-        result_prefix = result[: 2 if file_context_parts else 1]
-        history_in_order = list(reversed(history_added))
-        result = result_prefix + history_in_order
-        used = sum(self._message_tokens(msg) for msg in result)
-
-        for idx, msg in enumerate(incoming):
-            required = latest_user_index is not None and idx == latest_user_index
-            add("incoming", msg["role"], msg["content"], required=required)
-
-        if latest_user is None:
-            add("incoming", "user", "", required=True)
+        
+        # Assemble in chronological order: System -> History (oldest first) -> Files -> Incoming
+        result = system_bucket + list(reversed(history_bucket)) + file_bucket + incoming_bucket
+        
+        # Final token recalculation for the combined result
+        final_used = sum(self._message_tokens(msg) for msg in result)
 
         return ContextBuildResult(
             messages=result,
-            estimated_tokens=used,
+            estimated_tokens=final_used,
             discarded=discarded,
             token_breakdown=breakdown,
         )

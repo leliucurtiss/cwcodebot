@@ -44,8 +44,8 @@ def print_messages(messages, label):
         # print(f"{label} {i+1}: (Size: {message_size} chars)\n{message}\n")
 
     # Print total character size
-    # print(f"INFO: Total {label}s: {len(messages)}")
-    # print(f"INFO: Total character size: {total_char_size} chars\n")
+    print(f"INFO: Total {label}s: {len(messages)}")
+    print(f"INFO: Total character size: {total_char_size} chars\n")
 
 def create_app(config_path: str | None = None, config: AppConfig | None = None, gateway: MaasGateway | None = None) -> FastAPI:
     cfg = config or load_config(config_path)
@@ -140,8 +140,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         x_harness_project_id: str | None = Header(default=None),
         x_harness_conversation_id: str | None = Header(default=None),
     ) -> Any:
-        # Print the messages and their length
-        print_messages(req.messages,"request")
+        # # Print the messages and their length
+        # print_messages(req.messages,"request")
 
         session = session_manager.resolve(x_harness_project_id, x_harness_conversation_id)
         memory = memory_manager.load(session.project, session.conversation)
@@ -160,10 +160,48 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
         payload = req.model_dump(exclude_none=True)
         payload["model"] = req.model or cfg.maas.default_model
+        payload["max_tokens"] = cfg.context.model_context_max
         payload["messages"] = built.messages
-        payload.pop("context_files", None)
 
+        # payload.pop("tools",None)
+        # # The simplest possible tool definition
+        # test_functions = [
+        #     {
+        #         "name": "get_weather",
+        #         "description": "Get the weather",
+        #         "parameters": {
+        #             "type": "object",
+        #             "properties": {
+        #                 "location": {
+        #                     "type": "string", 
+        #                     "description": "The city"
+        #                 }
+        #             },
+        #             "required": ["location"]
+        #         }
+        #     }
+        # ]
+        # payload["functions"] = test_functions
+        # payload.pop("tools", None)
+        # # payload.pop("parallel_tool_calls", None)
+        # # payload.pop("stream_options", None)
+        # # payload.pop("context_files", None)
+        # payload = {
+        #     "model": req.model,
+        #     "messages": built.messages,
+        #     "stream": req.stream if req.stream is not None else False,
+        #     "temperature": req.temperature if req.temperature is not None else 0.7,
+        # }
         if req.stream:
+            # --- DIAGNOSTIC LOGGING START ---
+            # print(f"Model: {payload['model']}")
+            total_size = sum(len(msg.get('content', '')) for msg in payload['messages'])
+            print(f"\nINFO: Total constructed message size: {total_size} characters")
+            # print(f"DEBUG: FINAL_CONSTRUCTED_MESSAGES: {payload['messages']}")
+            # This prints hyperparameters like temperature, top_p, etc.
+            # print(f"Parameters: { {k: v for k, v in payload.items() if k != 'messages' and k != 'model'} }")
+            # print("="*80 + "\n")
+            # --- DIAGNOSTIC LOGGING END ---
             async def stream() -> Any:
                 thought_header_printed = False
                 buffer = b""
@@ -213,7 +251,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 if not thought_header_printed:
                                     print("\n--- Thinking ---", flush=True)
                                     thought_header_printed = True
-                                print(reasoning, end="", flush=True)
+                                # print(reasoning, end="", flush=True)
 
                             # 2. Handle Native Tool Calls (Pass-through)
                             tool_calls = delta.get("tool_calls")
@@ -232,16 +270,17 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                     elif not (pending_content.startswith('T') or pending_content.startswith('`')):
                                         # Definitely not a marker, flush immediately
                                         yield _content_sse(pending_content)
-                                        print(pending_content, end="", flush=True)
+                                        # print(pending_content, end="", flush=True)
                                         pending_content = ""
                                     elif len(pending_content) > max(len(m) for m in tool_markers):
                                         # Buffered enough to know it's not a marker
                                         yield _content_sse(pending_content)
-                                        print(pending_content, end="", flush=True)
+                                        # print(pending_content, end="", flush=True)
                                         pending_content = ""
                                 else:
                                     # We are in tool mode, just accumulate
-                                    print(content, end="", flush=True)
+                                    # print(content, end="", flush=True)
+                                    pass
 
                             # 3. Handle Finish Reason
                             if choice.get("finish_reason") is not None:
@@ -273,7 +312,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         response = await maas.chat_completion(payload)
-        print(f"Response: {response}")  # Print the non-streaming response
+        # print(f"Response: {response}")  # Print the non-streaming response
         assistant_text = _extract_assistant_text(response)
         if assistant_text:
             storage.add_message(session.conversation.id, "assistant", assistant_text)

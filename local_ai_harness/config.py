@@ -42,10 +42,12 @@ class ContextConfig:
     model_context_max: int = 128000
     safe_input_budget: int = 128000
     output_reserve: int = 16000
-    token_char_ratio: float = 3.0
-    token_safety_multiplier: float = 1.25
+    # token_char_ratio: float = 3.0
+    # token_safety_multiplier: float = 1.25
+    token_char_ratio: float = 1.0
+    token_safety_multiplier: float = 1.0
     max_file_bytes: int = 12374
-    max_compressed_length: int = 10240  # Add this line to include the new attribute
+    max_compressed_length: int = 128000  # Add this line to include the new attribute
 
 @dataclass(frozen=True)
 class WorkspaceConfig:
@@ -101,10 +103,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             model_context_max=int(context.get("model_context_max", 128000)),
             safe_input_budget=int(context.get("safe_input_budget", 128000)),
             output_reserve=int(context.get("output_reserve", 16000)),
-            token_char_ratio=float(context.get("token_char_ratio", 3.0)),
-            token_safety_multiplier=float(context.get("token_safety_multiplier", 1.25)),
-            max_file_bytes=int(context.get("max_file_bytes", 16000)),
-            max_compressed_length=int(context.get("max_compressed_length", 10000)),  # Add this line to include the new attribute
+            token_char_ratio=float(context.get("token_char_ratio", 1.0)),
+            token_safety_multiplier=float(context.get("token_safety_multiplier", 1.0)),
+            max_file_bytes=int(context.get("max_file_bytes", 10240)),
+            max_compressed_length=int(context.get("max_compressed_length", 10240)),  # Add this line to include the new attribute
         ),
         workspace=WorkspaceConfig(
             root=Path(workspace.get("root", ".")).expanduser().resolve(),

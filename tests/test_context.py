@@ -11,7 +11,7 @@ from local_ai_harness.workspace import WorkspaceReader
 def test_context_builder_keeps_latest_user_even_with_tiny_budget(tmp_path: Path) -> None:
     project = Project("p", str(tmp_path), "memory", "now", "now")
     builder = ContextBuilder(
-        ContextConfig(safe_input_budget=120, token_char_ratio=3.0, token_safety_multiplier=1.0),
+        ContextConfig(safe_input_budget=120, token_char_ratio=1.0, token_safety_multiplier=1.0),
         WorkspaceReader(tmp_path, max_file_bytes=1000),
     )
     stored = [
