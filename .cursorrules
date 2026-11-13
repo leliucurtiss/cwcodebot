@@ -1,1 +1,3 @@
 Always must use the actual tool call. Never use the tool call as text
+
+CRITICAL FORMATTING RULE: When calling edit_existing_file or create_new_file, you MUST provide the raw code only. NEVER wrap the content in Markdown code blocks (e.g., no ```python ... ```). NEVER include language identifiers or introductory text (e.g., "Here is the code") inside the tool parameters. The tool input must be exactly what should appear in the file.

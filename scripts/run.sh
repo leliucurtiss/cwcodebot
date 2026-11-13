@@ -4,7 +4,7 @@ set -euo pipefail
 HOST="${HARNESS_HOST:-0.0.0.0}"
 PORT="${HARNESS_PORT:-8000}"
 
-exec uvicorn local_ai_harness.app:create_app \
+exec uvicorn --reload local_ai_harness.app:create_app \
   --factory \
   --host "$HOST" \
  --port "$PORT" > harness.log 2>&1

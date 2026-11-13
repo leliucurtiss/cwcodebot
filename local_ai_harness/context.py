@@ -92,19 +92,23 @@ class ContextBuilder:
                 discarded.append(label)
                 return False
             
-            if required and used + cost > budget:
-                # Compress the context instead of raising an error
-                compressed_content = self.compress_context(content)
-                msg = {"role": role, "content": compressed_content}
-                cost = self._message_tokens(msg)
-                if used + cost <= budget:
-                    bucket.append(msg)
-                    used += cost
-                    breakdown[label] = breakdown.get(label, 0) + cost
-                    return True
-                else:
-                    discarded.append(label)
-                    return False
+            # if required and used + cost > budget:
+            #     # Compress the context instead of raising an error
+            #     compressed_content = self.compress_context(content)
+            #     msg = {"role": role, "content": compressed_content}
+            #     cost = self._message_tokens(msg)
+            #     if used + cost <= budget:
+            #         bucket.append(msg)
+            #         used += cost
+            #         breakdown[label] = breakdown.get(label, 0) + cost
+            #         return True
+            #     else:
+            #         discarded.append(label)
+            #         return False
+            
+            if not required or used + cost > budget:
+                discarded.append(label)
+                return False
             
             bucket.append(msg)
             used += cost
@@ -115,7 +119,11 @@ class ContextBuilder:
         system_text = (
             "You are a software engineering assistant.\n"
             "Always try best to use OpenAI JSON tool call format.\n"
-            "Never apply files, use either edit or wait user to edit and/o apply.\n"
+            "CRITICAL FORMATTING RULE: When calling edit_existing_file or "
+            "create_new_file, you MUST provide the raw code only. "
+            "NEVER wrap the content in Markdown code blocks (e.g., no ```python ... ```). "
+            "NEVER include language identifiers or introductory text (e.g., \"Here is the code\") "
+            "inside the tool parameters. The tool input must be exactly what should appear in the file."
             "When information is missing, call tools to read file to get detail needed.\n\n"
             f"{(memory or HierarchicalMemory(project.memory_summary, '')).render()}"
         )

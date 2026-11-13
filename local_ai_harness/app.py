@@ -97,17 +97,46 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         # print(f"DEBUG: [Route] Received completion request: {req.prompt[:100]}")
         # Wrap the completion prompt into a chat request
         # We use a system prompt to force the model into 'completion mode'
+        # SAFETY VALVE: Limit prompt size to prevent "bloat" from the client.
+        # We keep the SUFFIX (the end of the prompt) because that is where the cursor is.
+        MAX_COMPLETION_PROMPT_LEN = 1024 
+        prompt = req.prompt
+
+        # Return immediately for Ghost empty autocomp
+        if not prompt or not prompt.strip():
+            print(f"INFO: [Autocomp] Return immediately without Calling MAAS: with request (len:{len(prompt)} prompt: {prompt[:100]}", flush=True)
+            return {
+                "id": f"cmpl-{uuid.uuid4().hex[:12]}",
+                "object": "text_completion",
+                "created": 0,
+                "model": req.model or cfg.maas.default_model,
+                "choices": [
+                    {
+                        "text": "",
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": "stop"
+                    }
+                ]
+            }
+
+        if prompt and len(prompt) > MAX_COMPLETION_PROMPT_LEN:
+            # print(f"INFO: [Autocomp] Prompt too large ({len(prompt)} chars). Truncating to last {MAX_COMPLETION_PROMPT_LEN} chars.")
+            prompt = prompt[-MAX_COMPLETION_PROMPT_LEN:]
+
+        # Wrap the completion prompt into a chat request
         chat_payload = {
             "model": req.model or cfg.maas.default_model,
             "messages": [
                 {"role": "system", "content": "You are a code completion engine. Your task is to provide the immediate next tokens of code that logically follow the provided prompt. Do not explain, do not apologize, do not wrap in markdown blocks. Provide ONLY the code completion."},
-                {"role": "user", "content": req.prompt}
+                {"role": "user", "content": prompt}
             ],
             "temperature": req.temperature if req.temperature is not None else 0.0,
             "max_tokens": req.max_tokens,
         }
         
-        print(f"INFO: [Route] Calling MAAS chat_completion... Payload model: {chat_payload['model']}")
+      
+        print(f"INFO: [Autocomp] Calling MAAS with request (len:{len(prompt)} prompt: {prompt[:50]}")
         try:
             response = await maas.chat_completion(chat_payload)
         except Exception as e:
@@ -116,7 +145,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         
         # Extract the content
         assistant_text = _extract_assistant_text(response)
-        print(f"INFO: [Route] Received response from MAAS: {assistant_text[:100]}")
+        print(f"INFO: [Autocomp] Received response from MAAS: {assistant_text[:50]}",flush=True)
         
         # Return in OpenAI completions format
         return {
@@ -275,7 +304,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                     elif len(pending_content) > max(len(m) for m in tool_markers):
                                         # Buffered enough to know it's not a marker
                                         yield _content_sse(pending_content)
-                                        # print(pending_content, end="", flush=True)
+                                        # print(f"{pending_content}", end="", flush=True)
                                         pending_content = ""
                                 else:
                                     # We are in tool mode, just accumulate
@@ -426,7 +455,7 @@ def _translate_tool_call(raw_text: str) -> str | None:
 
     """   
 # --- Strategy 1: Try to extract JSON (Handles Format 2 & 3) ---
-    print(f"WARNING: translating tool calls {raw_text}")
+    print(f"DEBUG: translating tool calls: \n {raw_text} ...\n")
     if any(m in raw_text for m in ["```tool", "```json"]) or raw_text.startswith("{"):
         try:
             # 1. Clean up the "stuttering" markers and markdown wraps
@@ -508,3 +537,4 @@ def _build_openai_tool_call(name: str, args: dict) -> str:
         }]
     }
     return json.dumps(tool_call, ensure_ascii=False)
+

@@ -1,0 +1,12 @@
+curl http://10.104.74.13:4000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DEVSTRAL_API_KEY" \
+  -H "x-harness-project-id: test-project" \
+  -H "x-harness-conversation-id: test-conv" \
+  -d '{
+    "model": "gemma4",
+    "messages": [
+      {"role": "user", "content": "Hello! Can you see my files?"}
+    ],
+    "stream": false
+  }'
