@@ -41,11 +41,11 @@ def print_messages(messages, label):
         total_char_size += message_size
 
         # Print message with newline handling
-        # print(f"{label} {i+1}: (Size: {message_size} chars)\n{message}\n")
+        # print(f"{label} {i+1}: (Size: {message_size} chars)\n{message[:50]}\n")
 
     # Print total character size
     print(f"INFO: Total {label}s: {len(messages)}")
-    print(f"INFO: Total character size: {total_char_size} chars\n")
+    print(f"INFO: Total character size: {total_char_size} chars")
 
 def create_app(config_path: str | None = None, config: AppConfig | None = None, gateway: MaasGateway | None = None) -> FastAPI:
     cfg = config or load_config(config_path)
@@ -170,7 +170,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         x_harness_conversation_id: str | None = Header(default=None),
     ) -> Any:
         # # Print the messages and their length
-        # print_messages(req.messages,"request")
+        print_messages(req.messages,"request")
 
         session = session_manager.resolve(x_harness_project_id, x_harness_conversation_id)
         memory = memory_manager.load(session.project, session.conversation)
@@ -191,42 +191,13 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         payload["model"] = req.model or cfg.maas.default_model
         payload["max_tokens"] = cfg.context.model_context_max
         payload["messages"] = built.messages
-
-        # payload.pop("tools",None)
-        # # The simplest possible tool definition
-        # test_functions = [
-        #     {
-        #         "name": "get_weather",
-        #         "description": "Get the weather",
-        #         "parameters": {
-        #             "type": "object",
-        #             "properties": {
-        #                 "location": {
-        #                     "type": "string", 
-        #                     "description": "The city"
-        #                 }
-        #             },
-        #             "required": ["location"]
-        #         }
-        #     }
-        # ]
-        # payload["functions"] = test_functions
-        # payload.pop("tools", None)
-        # # payload.pop("parallel_tool_calls", None)
-        # # payload.pop("stream_options", None)
-        # # payload.pop("context_files", None)
-        # payload = {
-        #     "model": req.model,
-        #     "messages": built.messages,
-        #     "stream": req.stream if req.stream is not None else False,
-        #     "temperature": req.temperature if req.temperature is not None else 0.7,
-        # }
+      
         if req.stream:
             # --- DIAGNOSTIC LOGGING START ---
             # print(f"Model: {payload['model']}")
             total_size = sum(len(msg.get('content', '')) for msg in payload['messages'])
-            print(f"\nINFO: Total constructed message size: {total_size} characters")
-            # print(f"DEBUG: FINAL_CONSTRUCTED_MESSAGES: {payload['messages']}")
+            print(f"INFO: Total constructed message size: {total_size} characters")
+            print(f"      SYS: {str(payload['messages'])[2800:2880]}")
             # This prints hyperparameters like temperature, top_p, etc.
             # print(f"Parameters: { {k: v for k, v in payload.items() if k != 'messages' and k != 'model'} }")
             # print("="*80 + "\n")
@@ -280,7 +251,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 if not thought_header_printed:
                                     print("\n--- Thinking ---", flush=True)
                                     thought_header_printed = True
-                                # print(reasoning, end="", flush=True)
+                                #print(f"DEBUG: reasoning len {len(reasoning)} of {reasoning[0:50]}",  end="", flush=True)
 
                             # 2. Handle Native Tool Calls (Pass-through)
                             tool_calls = delta.get("tool_calls")
@@ -426,7 +397,7 @@ def _content_sse(content: str) -> bytes:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
 def _tool_calls_sse(tool_calls: Any) -> bytes:
-    print(f"INFO: native tool call",tool_calls)
+    # print(f"INFO: native tool call",tool_calls)
     event = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 

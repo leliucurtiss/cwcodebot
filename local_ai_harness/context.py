@@ -16,6 +16,26 @@ def message_content_to_text(content: Any) -> str:
         return content
     return str(content)
 
+def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) -> bool:
+    """
+    Circuit Breaker: Detects if the assistant is repeating itself.
+    Compares the last two assistant messages using Jaccard similarity.
+    """
+    assistant_msgs = [m["content"] for m in messages if m["role"] == "assistant"]
+    if len(assistant_msgs) < 2:
+        return False
+    
+    m1 = assistant_msgs[-1].lower()
+    m2 = assistant_msgs[-2].lower()
+    
+    set1 = set(m1.split())
+    set2 = set(m2.split())
+    intersection = len(set1.intersection(set2))
+    union = len(set1.union(set2))
+    
+    similarity = intersection / union if union > 0 else 0
+    return similarity > threshold
+
 @dataclass
 class ContextBuildResult:
     messages: list[dict[str, str]]
@@ -50,7 +70,7 @@ class ContextBuilder:
     def estimate_tokens(self, text: str) -> int:
         if not text:
             return 0
-        raw = len(text) / max(self.config.token_char_ratio, 1.0)
+        raw = len(text) / max(self.config.token_char_ratio, 3.0)
         return int(raw * self.config.token_safety_multiplier) + 1
 
     def _message_tokens(self, message: dict[str, str]) -> int:
@@ -122,6 +142,9 @@ class ContextBuilder:
             "CRITICAL FORMATTING RULE: When calling edit_existing_file or "
             "create_new_file, you MUST provide the raw code only. "
             "NEVER wrap the content in Markdown code blocks (e.g., no ```python ... ```). "
+            "CRITICAL: Do not repeat yourself. Avoid echoing the user's phrasing. "
+            "Do not repeat information that has already been provided in the conversation history. "
+            "If you find yourself repeating a pattern, break it and provide the information in a new way."
             "NEVER include language identifiers or introductory text (e.g., \"Here is the code\") "
             "inside the tool parameters. The tool input must be exactly what should appear in the file."
             "When information is missing, call tools to read file to get detail needed.\n\n"
@@ -165,20 +188,40 @@ class ContextBuilder:
         if file_context_parts:
             add(file_bucket, "explicit_files", "system", "\n\n".join(file_context_parts))
 
-        # 4. Recent History (Lowest Priority - fills remaining budget)
+        # 4. History (Lowest Priority - fills remaining budget)
         history_candidates = [
             {"role": msg.role, "content": msg.content}
             for msg in stored_messages
             if msg.role in {"user", "assistant", "system", "tool"}
         ]
         
-        # Add history from newest to oldest
-        for msg in reversed(history_candidates):
-            if not add(history_bucket, "recent_history", msg["role"], msg["content"]):
-                break
+        if history_candidates:
+            # Goal Anchor: First 2 messages to preserve original intent
+            for msg in history_candidates[:2]:
+                cost = self._message_tokens(msg)
+                if used + cost <= budget:
+                    used += cost
+                    history_bucket.append(msg)
+                    breakdown["goal_anchor"] = breakdown.get("goal_anchor", 0) + cost
+                else:
+                    discarded.append("goal_anchor")
+
+            # State Anchor: Most recent messages to preserve current state
+            state_anchor = []
+            for msg in reversed(history_candidates[2:]):
+                cost = self._message_tokens(msg)
+                if used + cost <= budget:
+                    used += cost
+                    state_anchor.append(msg)
+                    breakdown["state_anchor"] = breakdown.get("state_anchor", 0) + cost
+                else:
+                    discarded.append("state_anchor")
+                    break
+            
+            history_bucket.extend(reversed(state_anchor))
         
         # Assemble in chronological order: System -> History (oldest first) -> Files -> Incoming
-        result = system_bucket + list(reversed(history_bucket)) + file_bucket + incoming_bucket
+        result = system_bucket + history_bucket + file_bucket + incoming_bucket
         
         # Final token recalculation for the combined result
         final_used = sum(self._message_tokens(msg) for msg in result)
