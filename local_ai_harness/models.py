@@ -25,6 +25,21 @@ class ChatCompletionRequest(BaseModel):
         extra = "allow"
 
 
+class MessagesRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage]
+    system: str | None = None
+    max_tokens: int
+    stream: bool = False
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    stop_sequences: list[str] | None = None
+
+    class Config:
+        extra = "allow"
+
+
 class CompletionRequest(BaseModel):
     model: str | None = None
     prompt: str

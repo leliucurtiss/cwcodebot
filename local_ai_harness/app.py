@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import uuid
+import re
 from pathlib import Path
 from typing import Any
 
-from flask import Flask, Response
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response, Request
 from fastapi.responses import StreamingResponse
 
 from .config import AppConfig, load_config
@@ -21,6 +21,8 @@ from .models import (
     DebugContextRequest,
     ProjectCreateRequest,
     ProjectMemoryUpdate,
+    MessagesRequest,
+    ChatMessage,
 )
 from .session import SessionManager
 from .storage import Storage
@@ -44,8 +46,7 @@ def print_messages(messages, label):
         # print(f"{label} {i+1}: (Size: {message_size} chars)\n{message[:50]}\n")
 
     # Print total character size
-    print(f"INFO: Total {label}s: {len(messages)}")
-    print(f"INFO: Total character size: {total_char_size} chars")
+    print(f"INFO: Total {label}s: {len(messages)} with Total character size: {total_char_size} chars")
 
 def create_app(config_path: str | None = None, config: AppConfig | None = None, gateway: MaasGateway | None = None) -> FastAPI:
     cfg = config or load_config(config_path)
@@ -65,6 +66,14 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     app.state.memory_manager = memory_manager
     app.state.gateway = maas
 
+    # @app.middleware("http")
+    # async def log_requests(request: Request, call_next):
+    #     print(f"DEBUG: [Request] {request.method} {request.url.path}")
+    #     # print(f"DEBUG: [Headers] {request.headers}")
+    #     response = await call_next(request)
+    #     print(f"DEBUG: [Response] {request.method} {request.url.path} -> {response.status_code}")
+    #     return response
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         return {
@@ -83,6 +92,41 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         """Handshake endpoint for Claude Code / Anthropic compatibility check."""
         return {"status": "ok"}
 
+    async def _prepare_chat_context(
+        messages: list[ChatMessage],
+        project_id: str | None,
+        conversation_id: str | None,
+        context_files: list[str] | None = None,
+    ) -> tuple[Any, Any, list[dict[str, str]]]:
+        """
+        Common logic to resolve session, load memory, build context, and save messages.
+        Returns (session, payload_messages, original_messages).
+        """
+        session = session_manager.resolve(project_id, conversation_id)
+        memory = memory_manager.load(session.project, session.conversation)
+        stored = storage.list_messages(session.conversation.id)
+        
+        try:
+            built = context_builder.build(
+                session.project, 
+                memory, 
+                stored, 
+                messages, 
+                context_files or []
+            )
+        except ValueError as e:
+            print(f"Context building error: {e}")
+            raise
+
+        for msg in messages:
+            if msg.role in {"user", "assistant"}:
+                content = message_content_to_text(msg.content)
+                # Avoid duplicating messages already in storage
+                if not any(m.role == msg.role and m.content == content for m in stored):
+                    storage.add_message(session.conversation.id, msg.role, content)
+        
+        return session, built.messages, messages
+
     # HEAD handler
     @app.head("/v1/api/hello")
     async def api_hello_head():
@@ -90,10 +134,12 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         HEAD request handler — returns only headers, no body.
         """
         # 200 OK with no body
-        return Response(status = 200)
+        return Response(status_code=200)
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest) -> dict[str, Any]:
+        # ...existing code... (I will use a larger block to be safe)
+
         # print(f"DEBUG: [Route] Received completion request: {req.prompt[:100]}")
         # Wrap the completion prompt into a chat request
         # We use a system prompt to force the model into 'completion mode'
@@ -172,34 +218,30 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         # # Print the messages and their length
         print_messages(req.messages,"request")
 
-        session = session_manager.resolve(x_harness_project_id, x_harness_conversation_id)
-        memory = memory_manager.load(session.project, session.conversation)
-        stored = storage.list_messages(session.conversation.id)
-        context_files = req.context_files or []
-
-        try:
-            built = context_builder.build(session.project, memory, stored, req.messages, context_files)
-        except ValueError as e:
-            print(f"Context building error: {e}")
-            raise
-
-        for msg in req.messages:
-            if msg.role in {"user", "assistant"}:
-                storage.add_message(session.conversation.id, msg.role, message_content_to_text(msg.content))
+        session, built_messages, _ = await _prepare_chat_context(
+            req.messages, x_harness_project_id, x_harness_conversation_id, req.context_files
+        )
 
         payload = req.model_dump(exclude_none=True)
         payload["model"] = req.model or cfg.maas.default_model
         payload["max_tokens"] = cfg.context.model_context_max
-        payload["messages"] = built.messages
+        payload["messages"] = built_messages
       
         if req.stream:
             # --- DIAGNOSTIC LOGGING START ---
             # print(f"Model: {payload['model']}")
+            params = {k: v for k, v in payload.items() if k != 'messages' and k != 'model'}
+            # print(f"INFO: Parameters size: {len(str(params))} characters")
+            paramSize = 0
+            for k, v in params.items():
+                paramSize = paramSize + len(str(v))
+            print(f"INFO: Param total:{paramSize} chars")
+
             total_size = sum(len(msg.get('content', '')) for msg in payload['messages'])
             print(f"INFO: Total constructed message size: {total_size} characters")
+
             print(f"      SYS: {str(payload['messages'])[2800:2880]}")
             # This prints hyperparameters like temperature, top_p, etc.
-            # print(f"Parameters: { {k: v for k, v in payload.items() if k != 'messages' and k != 'model'} }")
             # print("="*80 + "\n")
             # --- DIAGNOSTIC LOGGING END ---
             async def stream() -> Any:
@@ -207,9 +249,11 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                 buffer = b""
                 pending_content = ""
                 text_tool_call = False
+                pending_reasoning = ""
+                text_tool_call_reasoning = False
 
                 # Markers for tool detection
-                tool_markers = ["TOOL_NAME:", "```tool", "```json"]
+                tool_markers = ["TOOL_NAME:", "```tool", "<tool_code>","<tool_call>"]
 
                 async for chunk in maas.stream_chat_completion(payload):
                     buffer += chunk
@@ -222,6 +266,19 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
                         if line == "data: [DONE]":
                             # Final Flush: Handle remaining buffer
+                            # 1. Handle text_tool_call in reasoning
+                            if text_tool_call_reasoning:
+                                translated_r = _translate_tool_call(pending_reasoning)
+                                if translated_r:
+                                    yield f"data: {translated_r}\n\n".encode("utf-8")
+                                elif pending_reasoning:
+                                    yield _reason_sse(pending_reasoning)
+                            elif pending_reasoning:
+                                yield _reason_sse(pending_reasoning)
+                            pending_reasoning = ""
+                            text_tool_call_reasoning = False
+
+                            # 2. Handle text_tool_call in Contents
                             if text_tool_call:
                                 translated = _translate_tool_call(pending_content)
                                 if translated:
@@ -232,6 +289,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 yield _content_sse(pending_content)
                             pending_content = ""
                             text_tool_call = False
+
+                            # 3. Yield and flush
                             yield raw_line + b"\n"
                             continue
 
@@ -247,47 +306,77 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                             # 1. Handle Reasoning (Thinking)
                             reasoning = delta.get("reasoning_content")
                             if reasoning:
-                                yield _reason_sse(reasoning)
+                                pending_reasoning += reasoning
+                                if not text_tool_call_reasoning:
+                                    stripped_r = pending_reasoning.lstrip()
+                                    if any(stripped_r.startswith(m) for m in tool_markers):
+                                        text_tool_call_reasoning = True
+                                    elif not (stripped_r.startswith('T') or stripped_r.startswith('`') or stripped_r.startswith('<')):
+                                        yield _reason_sse(pending_reasoning)
+                                        pending_reasoning = ""
+                                    elif len(pending_reasoning) > max(len(m) for m in tool_markers) + 10:
+                                        yield _reason_sse(pending_reasoning)
+                                        pending_reasoning = ""
+                                
                                 if not thought_header_printed:
                                     print("\n--- Thinking ---", flush=True)
                                     thought_header_printed = True
-                                #print(f"DEBUG: reasoning len {len(reasoning)} of {reasoning[0:50]}",  end="", flush=True)
+                                    #print(f"DEBUG: reasoning len {len(reasoning)} of {reasoning[0:50]}",  end="", flush=True)
 
                             # 2. Handle Native Tool Calls (Pass-through)
                             tool_calls = delta.get("tool_calls")
                             if tool_calls:
                                 yield _tool_calls_sse(tool_calls)
 
-                            # 2. Handle Content (and Text-to-Tool Translation)
+                            # 3. Handle Content (and Text-to-Tool Translation)
                             content = delta.get("content")
                             if isinstance(content, str) and content:
                                 pending_content += content
 
                                 if not text_tool_call:
-                                    # Decision Logic: Is this a tool call or just text?
-                                    if any(pending_content.startswith(m) for m in tool_markers):
+                                    # 1. Create a stripped version for detection only
+                                    stripped = pending_content.lstrip()
+
+                                    # 2. Check if the stripped content starts with any of our markers
+                                    if any(stripped.startswith(m) for m in tool_markers):
                                         text_tool_call = True
-                                    elif not (pending_content.startswith('T') or pending_content.startswith('`')):
+                                    # 3. Buffer if it starts with any character that COULD be a marker (T, `, or <)
+                                    elif not (stripped.startswith('T') or stripped.startswith('`') or stripped.startswith('<')):
                                         # Definitely not a marker, flush immediately
                                         yield _content_sse(pending_content)
-                                        # print(pending_content, end="", flush=True)
                                         pending_content = ""
-                                    elif len(pending_content) > max(len(m) for m in tool_markers):
-                                        # Buffered enough to know it's not a marker
+                                    elif len(pending_content) > max(len(m) for m in tool_markers) + 10:
+                                        # Buffered enough to know it's not a marker (added padding for whitespace)
                                         yield _content_sse(pending_content)
-                                        # print(f"{pending_content}", end="", flush=True)
                                         pending_content = ""
                                 else:
                                     # We are in tool mode, just accumulate
-                                    # print(content, end="", flush=True)
+                                    print(content, end="", flush=True)
                                     pass
 
                             # 3. Handle Finish Reason
                             if choice.get("finish_reason") is not None:
+                                print(f"DEBUG: are were here with tool call {text_tool_call}")
+                                # 3.1 Handle text_tool_call in reasoning
+                                if text_tool_call_reasoning:
+                                    translated_r, remaining_r = _translate_tool_call(pending_reasoning)
+                                    if translated_r:
+                                        yield f"data: {translated_r}\n\n".encode("utf-8")
+                                        if remaining_r:
+                                            yield _reason_sse(remaining_r)
+                                    elif pending_reasoning:
+                                        yield _reason_sse(pending_reasoning)
+                                elif pending_reasoning:
+                                    yield _reason_sse(pending_reasoning)
+                                pending_reasoning = ""
+                                text_tool_call_reasoning = False                                
+                                # 3.2 Handle text_tool_call in content
                                 if text_tool_call:
-                                    translated = _translate_tool_call(pending_content)
+                                    translated, remaining_c = _translate_tool_call(pending_content)
                                     if translated:
                                         yield f"data: {translated}\n\n".encode("utf-8")
+                                        if remaining_c:
+                                            yield _content_sse(remaining_c)
                                     elif pending_content:
                                         yield _content_sse(pending_content)
                                 elif pending_content:
@@ -298,11 +387,25 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 text_tool_call = False
 
                 # Final Cleanup for any trailing buffer
+                if pending_reasoning:
+                    if text_tool_call_reasoning:
+                        translated_r, remaining_r = _translate_tool_call(pending_reasoning)
+                        if translated_r:
+                            yield f"data: {translated_r}\n\n".encode("utf-8")
+                            if remaining_r:
+                                yield _reason_sse(remaining_r)
+                        else:
+                            yield _reason_sse(pending_reasoning)
+                    else:
+                        yield _reason_sse(pending_reasoning)
+
                 if pending_content:
                     if text_tool_call:
-                        translated = _translate_tool_call(pending_content)
+                        translated, remaining_c = _translate_tool_call(pending_content)
                         if translated:
                             yield f"data: {translated}\n\n".encode("utf-8")
+                            if remaining_c:
+                                yield _content_sse(remaining_c)
                         else:
                             yield _content_sse(pending_content)
                     else:
@@ -318,7 +421,92 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             storage.add_message(session.conversation.id, "assistant", assistant_text)
         return response
 
+    @app.post("/v1/messages")
+    async def messages(
+        req: MessagesRequest,
+        x_harness_project_id: str | None = Header(default=None),
+        x_harness_conversation_id: str | None = Header(default=None),
+    ) -> Any:
+        """
+        Anthropic Messages API wrapper for Claudecode compatibility.
+        """
+        # 1. Translate Anthropic request to internal format
+        # Anthropic separates system prompt from messages
+        print(f"This is message from Claude {req.messages}")
+        internal_messages = list(req.messages)
+        if req.system:
+            # We prepend the system prompt to the messages list for our ContextBuilder
+            internal_messages.insert(0, ChatMessage(role="system", content=req.system))
+
+        # 2. Prepare context and save messages
+        session, built_messages, _ = await _prepare_chat_context(
+            internal_messages, x_harness_project_id, x_harness_conversation_id
+        )
+
+        # 3. Build payload for MAAS (OpenAI format)
+        payload = {
+            "model": req.model or cfg.maas.default_model,
+            "messages": built_messages,
+            "max_tokens": req.max_tokens or cfg.context.model_context_max,
+            "temperature": req.temperature,
+            "stream": req.stream,
+        }
+
+        if req.stream:
+            async def anthropic_stream() -> Any:
+                # We wrap the OpenAI stream into Anthropic SSE events
+                # Simplified: just send content_block_delta
+                async for chunk in maas.stream_chat_completion(payload):
+                    # This is a bit complex because maas.stream_chat_completion 
+                    # returns OpenAI SSE bytes. We need to parse them and re-emit.
+                    # For now, let's just pass through the content if we can.
+                    # A better way would be to use the same logic as chat_completions stream
+                    # but emit Anthropic events.
+                    
+                    # To keep it simple for the first iteration, we'll just 
+                    # yield the raw chunk if it's already SSE, but Claudecode 
+                    # expects specific event types.
+                    
+                    # Let's implement a basic translation of the OpenAI SSE to Anthropic SSE
+                    if chunk.startswith(b"data: "):
+                        line = chunk.decode("utf-8").strip()
+                        if line == "data: [DONE]":
+                            yield b"event: message_stop\ndata: {}\n\n"
+                            continue
+                        
+                        try:
+                            data = json.loads(line[6:])
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': content}})}\n\n".encode("utf-8")
+                        except:
+                            continue
+                    yield chunk
+                return
+
+            return StreamingResponse(anthropic_stream(), media_type="text/event-stream")
+
+        # Non-streaming response
+        response = await maas.chat_completion(payload)
+        assistant_text = _extract_assistant_text(response)
+        if assistant_text:
+            storage.add_message(session.conversation.id, "assistant", assistant_text)
+        
+        # Translate OpenAI response to Anthropic format
+        return {
+            "id": f"msg_{uuid.uuid4().hex[:12]}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": assistant_text}],
+            "model": payload["model"],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }
+
     @app.post("/harness/projects")
+
     async def create_project(req: ProjectCreateRequest) -> dict[str, Any]:
         project_id = req.project_id or f"proj-{uuid.uuid4().hex[:12]}"
         root_path = str(Path(req.root_path).expanduser().resolve()) if req.root_path else str(cfg.workspace.root)
@@ -393,102 +581,151 @@ def _reason_sse(content: str) -> bytes:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
 def _content_sse(content: str) -> bytes:
+    # print({content})
     event = {"choices": [{"delta": {"content": content}}]}
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
 def _tool_calls_sse(tool_calls: Any) -> bytes:
-    # print(f"INFO: native tool call",tool_calls)
+    print(f"INFO: native tool call",tool_calls)
     event = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
-def _translate_tool_call(raw_text: str) -> str | None:
+def _translate_tool_call(raw_text: str) -> tuple[str | None, str]:
     """
-    Translates MaaS text format:
-    # 1st examp
-    ```
-    TOOL_NAME: read_file
-    BEGIN_ARG: filePath
-    "/path/to/file"
-    END_ARG
-    ```
-    # or 2nd example
-    ```
-    tool
-    {
-        "command": "file_glob_search",
-        "parameters": {
-            "pattern": "app.py"
-        }
-    }
-    ``` 
-    #3rd example 
-    ```tool```tool```tool```tool```tool```tool```tool{"command": "read_file","parameters": {"filepath": "local_ai_harness/app.py"}}```
+    Translates MaaS text format into OpenAI tool call SSE.
+    Returns (translated_json_or_none, remaining_text).
+    """
+    print(f"DEBUG: translating tool calls: \n")
 
-    """   
-# --- Strategy 1: Try to extract JSON (Handles Format 2 & 3) ---
-    print(f"DEBUG: translating tool calls: \n {raw_text} ...\n")
-    if any(m in raw_text for m in ["```tool", "```json"]) or raw_text.startswith("{"):
+    # --- Strategy 0: XML-like format (<tool_code> or <tool_call>) ---
+    if any(m in raw_text for m in ["<tool_code>", "<tool_call>", "<function_name>"]):
+        # First, try the specific <function_name>/<parameters> format
         try:
-            # 1. Clean up the "stuttering" markers and markdown wraps
-            # Remove all leading occurrences of ```tool
-            json_content = raw_text
-            while json_content.startswith("```tool"):
-                json_content = json_content[len("```tool"):].lstrip()
+            name_match = re.search(r"<function_name>\s*(.*?)\s*</function_name>", raw_text)
+            params_match = re.search(r"<parameters>\s*(.*?)\s*</parameters>", raw_text, re.DOTALL)
             
-            # Remove leading ``` if it's just a standard code block
-            if json_content.startswith("```"):
-                json_content = json_content[3:].lstrip()
-                
-            # Remove trailing ```
-            if json_content.endswith("```"):
-                json_content = json_content[:-3].rstrip()
-
-            # 2. Parse the JSON
-            data = json.loads(json_content)
-            
-            # The MaaS JSON format usually uses "command" and "parameters"
-            tool_name = data.get("command")
-            args = data.get("parameters", {})
-
-            if tool_name:
-                return _build_openai_tool_call(tool_name, args)
-        except (json.JSONDecodeError, AttributeError):
-            # If JSON parsing fails, we fall through to the legacy line-by-line parser
+            if name_match and params_match:
+                tool_name = name_match.group(1).strip()
+                args_str = params_match.group(1).strip()
+                try:
+                    args = json.loads(args_str)
+                    # Find where the tool call ends to return remaining text
+                    end_pos = raw_text.find("</parameters>") + len("</parameters>")
+                    # If there's a closing </tool_call> or </tool_code>, skip that too
+                    for tag in ["tool_call", "tool_code"]:
+                        end_tag = f"</{tag}>"
+                        if end_tag in raw_text[end_pos:]:
+                            end_pos += raw_text[end_pos:].find(end_tag) + len(end_tag)
+                    
+                    return _build_openai_tool_call(tool_name, args), raw_text[end_pos:]
+                except json.JSONDecodeError:
+                    pass
+        except Exception:
             pass
 
-# --- Strategy 2: Line-by-Line Parsing (Handles Format 1) ---
+        # Second, try JSON inside <tool_call> or <tool_code> tags
+        for tag in ["tool_call", "tool_code"]:
+            start_tag = f"<{tag}>"
+            end_tag = f"</{tag}>"
+            if start_tag in raw_text and end_tag in raw_text:
+                start_idx = raw_text.find(start_tag) + len(start_tag)
+                end_idx = raw_text.find(end_tag)
+                json_str = raw_text[start_idx:end_idx].strip()
+                try:
+                    data = json.loads(json_str)
+                    tool_name = data.get("command") or data.get("name")
+                    args = data.get("parameters") or data.get("arguments") or {}
+                    if tool_name:
+                        return _build_openai_tool_call(tool_name, args), raw_text[end_idx + len(end_tag):]
+                except json.JSONDecodeError:
+                    pass
+
+    # --- Strategy 1: Try to extract JSON (Handles Format 2 & 3) ---
+    if any(m in raw_text for m in ["```tool"]) or raw_text.strip().startswith("{"):
+        try:
+            json_content = raw_text
+            # Remove leading markers
+            while json_content.startswith("```tool"):
+                json_content = json_content[len("```tool"):].lstrip()
+            if json_content.startswith("```"):
+                json_content = json_content[3:].lstrip()
+            
+            # Find the end of the JSON block
+            if json_content.endswith("```"):
+                json_content = json_content[:-3].rstrip()
+            
+            # We need to find where the JSON actually ends if there's trailing text
+            # A simple way is to try and parse it, and if it fails, try to find the last '}'
+            try:
+                data = json.loads(json_content)
+                # If it parsed, we need to know how much of the original raw_text was used
+                # This is tricky because of the stripping. 
+                # For simplicity, if it's a ```tool block, we assume it ends at the next ```
+                if "```tool" in raw_text:
+                    end_pos = raw_text.find("```", raw_text.find("```tool") + 7)
+                    if end_pos != -1:
+                        end_pos += 3
+                        return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), raw_text[end_pos:]
+                
+                # If it just started with '{', we find the matching '}'
+                if raw_text.strip().startswith("{"):
+                    # Very basic brace matching
+                    count = 0
+                    for i, char in enumerate(raw_text):
+                        if char == '{': count += 1
+                        elif char == '}': count -= 1
+                        if count == 0 and i > 0:
+                            return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), raw_text[i+1:]
+                
+                return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), ""
+            except json.JSONDecodeError:
+                pass
+        except Exception:
+            pass
+
+    # --- Strategy 2: Line-by-Line Parsing (Handles Format 1) ---
     tool_name = ""
     args: dict[str, Any] = {}
     current_arg_key: str | None = None
     value_lines: list[str] = []
+    last_line_end = 0
 
-    for line in raw_text.splitlines():
+    lines = raw_text.splitlines(keepends=True)
+    for line in lines:
         stripped = line.strip()
         if stripped.startswith("TOOL_NAME:"):
             tool_name = stripped.removeprefix("TOOL_NAME:").strip()
         elif stripped.startswith("BEGIN_ARG:"):
-            if current_arg_key is not None:
-                return None
+            if current_arg_key is not None: break
             current_arg_key = stripped.removeprefix("BEGIN_ARG:").strip()
-            if not current_arg_key:
-                return None
+            if not current_arg_key: break
             value_lines = []
         elif stripped == "END_ARG":
-            if current_arg_key is None:
-                return None
+            if current_arg_key is None: break
             raw_value = "\n".join(value_lines).strip()
             try:
                 args[current_arg_key] = json.loads(raw_value)
             except json.JSONDecodeError:
                 args[current_arg_key] = raw_value.strip('"')
             current_arg_key = None
+            # We found a complete tool call if we have a name and args
+            if tool_name and args:
+                # Calculate where this ended
+                # This is approximate since we splitlines
+                # We'll just return the rest of the text from the current line
+                # But we need to know the index.
+                pass
         elif current_arg_key is not None:
             value_lines.append(line.strip())
+        
+        last_line_end += len(line)
 
     if tool_name and not current_arg_key and args:
-        return _build_openai_tool_call(tool_name, args)
+        # For Strategy 2, we'll just return the remaining text as empty for now 
+        # or try to calculate it.
+        return _build_openai_tool_call(tool_name, args), raw_text[last_line_end:]
 
-    return None
+    return None, raw_text
 
 def _build_openai_tool_call(name: str, args: dict) -> str:
     """Helper to wrap a tool name and args into the OpenAI SSE format."""
