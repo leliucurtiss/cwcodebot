@@ -96,103 +96,49 @@ class ContextBuilder:
         discarded: list[str] = []
         breakdown: dict[str, int] = {}
         used = 0
+        result = []
 
-        # 1. System Prompt (Highest Priority)
-        system_text = (
-            "You are a software engineering assistant.\n"
-            "Always try best to use OpenAI JSON tool call format.\n"
-            "CRITICAL FORMATTING RULE: When calling edit_existing_file or "
-            "create_new_file, you MUST provide the raw code only. "
-            "NEVER wrap the content in Markdown code blocks (e.g., no ```python ... ```). "
-            "CRITICAL: Do not repeat yourself. Avoid echoing the user's phrasing. "
-            "Do not repeat information that has already been provided in the conversation history. "
-            "If you find yourself repeating a pattern, break it and provide the information in a new way."
-            "NEVER include language identifiers or introductory text (e.g., \"Here is the code\") "
-            "inside the tool parameters. The tool input must be exactly what should appear in the file."
-            "When information is missing, call tools to read file to get detail needed.\n\n"
-            f"{(memory or HierarchicalMemory(project.memory_summary, '')).render()}"
-        )
-        
-        # We'll use a list for the final result
-        result: list[dict[str, str]] = [{"role": "system", "content": system_text}]
-        used += self._message_tokens(result[0])
-        breakdown["system"] = self._message_tokens(result[0])
-
-        # 2. Merge and Deduplicate History
-        # Combine stored and incoming, keeping chronological order
-        all_msgs = []
-        for msg in stored_messages:
-            if msg.role != "system":
-                all_msgs.append({"role": msg.role, "content": msg.content})
-        
+        # Transparently pass through all incoming messages (System, User, Assistant)
         for msg in incoming_messages:
-            if msg.role != "system":
-                all_msgs.append({"role": msg.role, "content": message_content_to_text(msg.content)})
-        
-        # Deduplicate while preserving order (keep the most recent version of a message)
-        seen = set()
-        deduped = []
-        for msg in reversed(all_msgs):
-            key = (msg["role"], msg["content"])
-            if key not in seen:
-                deduped.append(msg)
-                seen.add(key)
-        full_history = list(reversed(deduped))
-
-        # 3. Identify the "Current Turn"
-        # The current turn starts at the last user message
-        last_user_idx = -1
-        for i in range(len(full_history) - 1, -1, -1):
-            if full_history[i]["role"] == "user":
-                last_user_idx = i
-                break
-        
-        history_part = full_history[:last_user_idx] if last_user_idx != -1 else full_history
-        current_turn_part = full_history[last_user_idx:] if last_user_idx != -1 else []
-
-        # 4. Add History (Lowest Priority - fills remaining budget)
-        # We add history from the end (most recent) backwards until budget is hit
-        history_to_add = []
-        for msg in reversed(history_part):
-            cost = self._message_tokens(msg)
-            if used + cost <= budget:
-                history_to_add.append(msg)
-                used += cost
-                breakdown["history"] = breakdown.get("history", 0) + cost
-            else:
-                discarded.append("history_truncated")
-                break
-        
-        result.extend(reversed(history_to_add))
-
-        # 5. Explicit Files (Medium Priority - placed before the current turn)
-        file_context_parts: list[str] = []
-        for rel in context_files:
-            try:
-                text, truncated = self.workspace.read_text(rel)
-                marker = " truncated" if truncated else ""
-                file_context_parts.append(f"--- FILE: {rel}{marker} ---\n{text}")
-            except WorkspaceError as exc:
-                discarded.append(f"file:{rel}:{exc}")
-        
-        if file_context_parts:
-            file_msg = {"role": "system", "content": "\n\n".join(file_context_parts)}
-            cost = self._message_tokens(file_msg)
-            if used + cost <= budget:
-                result.append(file_msg)
-                used += cost
-                breakdown["explicit_files"] = cost
-            else:
-                discarded.append("explicit_files")
-
-        # 6. Current Turn (High Priority - always include if possible)
-        for msg in current_turn_part:
-            cost = self._message_tokens(msg)
-            # We try to include the current turn even if it exceeds budget slightly, 
-            # but we still track it.
-            result.append(msg)
+            content = message_content_to_text(msg.content)
+            msg_dict = {"role": msg.role, "content": content}
+            cost = self._message_tokens(msg_dict)
+            result.append(msg_dict)
             used += cost
-            breakdown["current_turn"] = breakdown.get("current_turn", 0) + cost
+            breakdown[msg.role] = breakdown.get(msg.role, 0) + cost
+
+        # 5. Explicit Files (Commented out for transparency/future RAG)
+        # file_context_parts: list[str] = []
+        # for rel in context_files:
+        #     try:
+        #         text, truncated = self.workspace.read_text(rel)
+        #         marker = " truncated" if truncated else ""
+        #         file_context_parts.append(f"--- FILE: {rel}{marker} ---\n{text}")
+        #     except WorkspaceError as exc:
+        #         discarded.append(f"file:{rel}:{exc}")
+        # 
+        # if file_context_parts:
+        #     file_msg = {"role": "system", "content": "\n\n".join(file_context_parts)}
+        #     cost = self._message_tokens(file_msg)
+        #     if used + cost <= budget:
+        #         result.append(file_msg)
+        #         used += cost
+        #         breakdown["explicit_files"] = cost
+        #     else:
+        #         discarded.append("explicit_files")
+
+        # SHould manage budget but comment out for a while 
+        # Debug check  
+        if used > budget:
+            print(f"Message {used} is beyond budget {budget}")
+            # discarded.append("budget_exceeded")
+
+        return ContextBuildResult(
+            messages=result,
+            estimated_tokens=used,
+            discarded=discarded,
+            token_breakdown=breakdown,
+        )
 
         # Final token recalculation
         final_used = sum(self._message_tokens(msg) for msg in result)

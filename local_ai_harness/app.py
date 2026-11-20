@@ -174,7 +174,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         chat_payload = {
             "model": req.model or cfg.maas.default_model,
             "messages": [
-                {"role": "system", "content": "You are a code completion engine. Your task is to provide the immediate next tokens of code that logically follow the provided prompt. Do not explain, do not apologize, do not wrap in markdown blocks. Provide ONLY the code completion."},
+                # {"role": "system", "content": "You are a code completion engine. Your task is to provide the immediate next tokens of code that logically follow the provided prompt. Do not explain, do not apologize, do not wrap in markdown blocks. Provide ONLY the code completion."},
                 {"role": "user", "content": prompt}
             ],
             "temperature": req.temperature if req.temperature is not None else 0.0,
@@ -253,7 +253,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                 text_tool_call_reasoning = False
 
                 # Markers for tool detection
-                tool_markers = ["TOOL_NAME:", "```tool", "<tool_code>","<tool_call>"]
+                tool_markers = ["TOOL_NAME:", "```tool", "tool_code", "tool_call", "<function_name>"]
+                # tool_markers = ["TOOL_NAME:", "```tool", "<tool_code>", "<function_name>"]
 
                 async for chunk in maas.stream_chat_completion(payload):
                     buffer += chunk
@@ -350,13 +351,15 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                         yield _content_sse(pending_content)
                                         pending_content = ""
                                 else:
-                                    # We are in tool mode, just accumulate
+                                    # We are in text_tool_call translating, just accumulate
                                     print(content, end="", flush=True)
                                     pass
 
                             # 3. Handle Finish Reason
                             if choice.get("finish_reason") is not None:
-                                print(f"DEBUG: are were here with tool call {text_tool_call}")
+                                if text_tool_call: 
+                                    print(f"DEBUG: We are finishing with tool call {text_tool_call}")
+
                                 # 3.1 Handle text_tool_call in reasoning
                                 if text_tool_call_reasoning:
                                     translated_r, remaining_r = _translate_tool_call(pending_reasoning)
@@ -724,7 +727,7 @@ def _translate_tool_call(raw_text: str) -> tuple[str | None, str]:
         # For Strategy 2, we'll just return the remaining text as empty for now 
         # or try to calculate it.
         return _build_openai_tool_call(tool_name, args), raw_text[last_line_end:]
-
+    print(f"DEBUG: text_tool_translate failed")
     return None, raw_text
 
 def _build_openai_tool_call(name: str, args: dict) -> str:
