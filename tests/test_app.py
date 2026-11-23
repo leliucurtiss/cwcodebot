@@ -20,6 +20,52 @@ class FakeGateway:
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
         }
 
+    async def stream_chat_completion(self, payload: dict[str, Any]):
+        # For non-streaming requests, the app.py logic still calls stream_chat_completion 
+        # if req.stream is True. But for non-streaming, it calls chat_completion.
+        # Wait, looking at app.py:
+        # if req.stream:
+        #     ...
+        #     async for chunk in maas.stream_chat_completion(payload):
+        # response = await maas.chat_completion(payload)
+        
+        # The test_chat_completion_route_uses_gateway uses req.stream=False (default).
+        # So it should call chat_completion.
+        # However, the error shows it's getting SSE data. 
+        # This means the app.py might be defaulting to stream or the test is hitting the stream path.
+        # Actually, the error is: s = 'data: {"choices": [{"delta": {"content": "ok"}}]}\n\ndata: [DONE]\n'
+        # This is exactly what I added to FakeGateway.stream_chat_completion.
+        # Why is it being called? 
+        # In app.py:
+        # @app.post("/v1/chat/completions")
+        # async def chat_completions(req: ChatCompletionRequest, ...):
+        #     ...
+        #     if req.stream:
+        #         ...
+        #         return StreamingResponse(stream(), ...)
+        #     response = await maas.chat_completion(payload)
+        #     ...
+        #     return response
+        
+        # If req.stream is False, it calls chat_completion.
+        # My FakeGateway.chat_completion returns a dict.
+        # But the error shows it's receiving SSE.
+        # This suggests that in the test, req.stream might be True or the app is behaving differently.
+        # Let's check the test:
+        # response = client.post(
+        #     "/v1/chat/completions",
+        #     json={"model": "devstral", "messages": [{"role": "user", "content": "hello"}]},
+        # )
+        # Here stream is not provided, so it defaults to True in ChatCompletionRequest!
+        # class ChatCompletionRequest(BaseModel):
+        #     ...
+        #     stream: bool = True
+        
+        # That's the problem. The test expects a JSON response but the request defaults to streaming.
+        
+        yield f"data: {json.dumps({'choices': [{'delta': {'content': 'ok'}}]})}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+
 
 class StreamingGateway(FakeGateway):
     async def stream_chat_completion(self, payload: dict[str, Any]):
@@ -49,7 +95,7 @@ def test_chat_completion_route_uses_gateway(tmp_path: Path) -> None:
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
-            json={"model": "devstral", "messages": [{"role": "user", "content": "hello"}]},
+            json={"model": "devstral", "stream": False, "messages": [{"role": "user", "content": "hello"}]},
         )
 
     assert response.status_code == 200
@@ -84,7 +130,7 @@ def test_text_tool_call_is_translated_in_stream_and_reasoning_is_preserved(tmp_p
 
 
 def test_translate_tool_call_rejects_incomplete_arguments() -> None:
-    assert _translate_tool_call("TOOL_NAME: read_file\nBEGIN_ARG: filePath\n/path") is None
+    assert _translate_tool_call("TOOL_NAME: read_file\nBEGIN_ARG: filePath\n/path")[0] is None
 
 
 def test_debug_context_route(tmp_path: Path) -> None:

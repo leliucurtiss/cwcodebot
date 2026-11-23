@@ -19,13 +19,39 @@ def message_content_to_text(content: Any) -> str:
 def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) -> bool:
     """
     Circuit Breaker: Detects if the assistant is repeating itself.
-    Compares the last two assistant messages using Jaccard similarity.
+    Checks for both turn-level repetition and internal message looping.
     """
     assistant_msgs = [m["content"] for m in messages if m["role"] == "assistant"]
+    if not assistant_msgs:
+        return False
+    
+    last_msg = assistant_msgs[-1].lower()
+
+    # 1. Internal Repetition Detection (Intra-message loop)
+    
+    # A. Character-level repetition (e.g., "thoughtthoughtthought" or "aaaaaaaa")
+    import re
+    # Matches any sequence of 3+ characters that repeats 3 or more times consecutively
+    if re.search(r'(.{2,})\1{2,}', last_msg):
+        return True
+
+    # B. Word-level repetition (n-grams)
+    words = last_msg.split()
+    if len(words) > 10:
+        n = 5  # Sequence length to track
+        sequences = []
+        for i in range(len(words) - n + 1):
+            sequences.append(" ".join(words[i:i+n]))
+        
+        for seq in set(sequences):
+            if sequences.count(seq) >= 3:
+                return True
+
+    # 2. Turn-level Repetition Detection (Inter-message loop)
     if len(assistant_msgs) < 2:
         return False
     
-    m1 = assistant_msgs[-1].lower()
+    m1 = last_msg
     m2 = assistant_msgs[-2].lower()
     
     set1 = set(m1.split())
@@ -133,19 +159,13 @@ class ContextBuilder:
             print(f"Message {used} is beyond budget {budget}")
             # discarded.append("budget_exceeded")
 
+        # Final token recalculation
+        final_used = sum(self._message_tokens(msg) for msg in result)
+        # print(f"INFO: Incoming message TOKENS {final_used} token")
+
         return ContextBuildResult(
             messages=result,
             estimated_tokens=used,
-            discarded=discarded,
-            token_breakdown=breakdown,
-        )
-
-        # Final token recalculation
-        final_used = sum(self._message_tokens(msg) for msg in result)
-
-        return ContextBuildResult(
-            messages=result,
-            estimated_tokens=final_used,
             discarded=discarded,
             token_breakdown=breakdown,
         )

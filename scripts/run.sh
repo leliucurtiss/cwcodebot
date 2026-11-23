@@ -9,5 +9,5 @@ exec uvicorn --reload local_ai_harness.app:create_app \
   --host "$HOST" \
   --port "$PORT" \
   --reload-exclude "tests/*" > harness.log 2>&1
-  # --port "$PORT"
+#  --reload > harness.log 2>&1
 
