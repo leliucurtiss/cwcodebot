@@ -66,29 +66,86 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     app.state.memory_manager = memory_manager
     app.state.gateway = maas
 
-    # @app.middleware("http")
-    # async def log_requests(request: Request, call_next):
-    #     print(f"\\n--- Incoming Request ---")
-    #     print(f"Method: {request.method}")
-    #     print(f"URL: {request.url}")
-    #     print(f"Headers: {dict(request.headers)}")
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        # Store request details in case we need to log them on error
+        method = request.method
+        url = request.url
+        headers = dict(request.headers)
         
-    #     body = await request.body()
-    #     if body:
-    #         # Print only a small portion of the body to avoid log bloat
-    #         print(f"Body: {body[:1000].decode('utf-8', errors='replace')}...")
-    #     else:
-    #         print(f"Body: [Empty]")
+        body = await request.body()
+        async def receive():
+            return {"type": "http.request", "body": body}
+        request._receive = receive
         
-    #     # We must wrap the body back into the request so subsequent handlers can read it
-    #     async def receive():
-    #         return {"type": "http.request", "body": body}
-    #     request._receive = receive
+        response = await call_next(request)
         
-    #     response = await call_next(request)
-    #     print(f"Response Status: {response.status_code}")
-    #     print(f"--- End Request ---\\n")
-    #     return response
+        # Only print detailed logs for errors (status >= 400)
+        if response.status_code >= 400:
+            print(f"\\n--- Error Request ---")
+            print(f"Method: {method}")
+            print(f"URL: {url}")
+            print(f"Headers: {headers}")
+            if body:
+                print(f"Body: {body[:1000].decode('utf-8', errors='replace')}...")
+            print(f"Response Status: {response.status_code}")
+            print(f"--- End Error Request ---\\n")
+            
+        return response
+
+    @app.get("/v1/oauth/hello")
+    @app.get("/oauth/hello")
+    async def oauth_hello():
+        """Handshake endpoint for Claude Code OAuth check."""
+        from datetime import datetime, timezone
+        from fastapi.responses import JSONResponse
+        now = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
+        return JSONResponse(
+            content={"status": "ok"},
+            headers={
+                "x-amzn-request-id": uuid.uuid4().hex,
+                "server": "cloudflare",
+                "date": now,
+                "content-type": "application/json",
+                "connection": "keep-alive",
+                "cache-control": "no-cache, no-store, must-revalidate",
+                "pragma": "no-cache",
+                "expires": "0",
+                "access-control-allow-origin": "*",
+                "access-control-allow-methods": "GET, POST, HEAD, OPTIONS",
+                "access-control-allow-headers": "*"
+            }
+        )
+
+    @app.post("/api/event_logging/v2/batch")
+    async def event_logging_batch():
+        """Telemetry endpoint to silence logging errors."""
+        return {"status": "ok"}
+
+    @app.post("/api/eval/{path:path}")
+    async def eval_telemetry(path: str):
+        """Telemetry endpoint for SDK evaluations."""
+        return {"status": "ok"}
+
+    @app.get("/mcp-registry/v0/servers")
+    async def mcp_servers():
+        """Mock MCP registry endpoint."""
+        return {"servers": []}
+
+    @app.get("/api/claude_code_penguin_mode")
+    async def penguin_mode():
+        """Mock penguin mode feature flag."""
+        return {"enabled": False}
+
+    @app.get("/api/claude_cli/bootstrap")
+    async def cli_bootstrap():
+        """Mock CLI bootstrap endpoint."""
+        return {"status": "ok", "version": "latest"}
+
+    @app.get("/api/directory/plugins")
+    async def plugin_directory():
+        """Mock plugin directory endpoint."""
+        return {"plugins": []}
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -108,16 +165,22 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     async def api_hello():
         """Handshake endpoint for Claude Code / Anthropic compatibility check."""
         from datetime import datetime, timezone
+        from fastapi.responses import JSONResponse
         now = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
-        return Response(
-            content=json.dumps({"status": "ok"}),
-            media_type="application/json",
+        return JSONResponse(
+            content={"status": "ok"},
             headers={
                 "x-amzn-request-id": uuid.uuid4().hex,
                 "server": "cloudflare",
                 "date": now,
                 "content-type": "application/json",
                 "connection": "keep-alive",
+                "cache-control": "no-cache, no-store, must-revalidate",
+                "pragma": "no-cache",
+                "expires": "0",
+                "connection": "keep-alive",
+                "cache-control": "no-cache, no-store, must-revalidate",
+                "pragma": "no-cache",
                 "access-control-allow-origin": "*",
                 "access-control-allow-methods": "GET, POST, HEAD, OPTIONS",
                 "access-control-allow-headers": "*"
@@ -176,8 +239,24 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         """
         HEAD request handler — returns only headers, no body.
         """
-        # 200 OK with no body
-        return Response(status_code=200)
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
+        return Response(
+            status_code=200,
+            headers={
+                "x-amzn-request-id": uuid.uuid4().hex,
+                "server": "cloudflare",
+                "date": now,
+                "content-type": "application/json",
+                "connection": "keep-alive",
+                "cache-control": "no-cache, no-store, must-revalidate",
+                "pragma": "no-cache",
+                "expires": "0",
+                "access-control-allow-origin": "*",
+                "access-control-allow-methods": "GET, POST, HEAD, OPTIONS",
+                "access-control-allow-headers": "*"
+            }
+        )
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest) -> dict[str, Any]:
@@ -494,6 +573,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
     @app.post("/v1/messages")
     @app.post("/messages")
+    @app.post("/v1/v1/messages")
     async def messages(
         req: MessagesRequest,
         x_harness_project_id: str | None = Header(default=None),
@@ -648,6 +728,16 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             raise HTTPException(404, "Conversation not found")
         conv = memory_manager.update_conversation_memory(conversation_id, req.memory_summary)
         return conv.__dict__
+
+    @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+    async def catch_all(request: Request, path: str):
+        """Catch-all route to log any unexpected requests from the client."""
+        print(f"DEBUG: [Catch-all] {request.method} /{path}")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            content={"error": "Endpoint not implemented in harness", "path": path},
+            status_code=404
+        )
 
     @app.post("/v1/debug/context")
     async def debug_context(req: DebugContextRequest) -> dict[str, Any]:

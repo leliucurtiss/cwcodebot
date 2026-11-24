@@ -3,8 +3,11 @@ set -euo pipefail
 
 HOST="${HARNESS_HOST:-0.0.0.0}"
 PORT="${HARNESS_PORT:-8000}"
-SSL_KEY="${HARNESS_SSL_KEY:-cert.pem}"
-SSL_CERT="${HARNESS_SSL_CERT:-key.pem}"
+# Use absolute paths for SSL certificates to avoid issues with CWD
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+SSL_KEY="${HARNESS_SSL_KEY:-$PROJECT_ROOT/key.pem}"
+SSL_CERT="${HARNESS_SSL_CERT:-$PROJECT_ROOT/cert.pem}"
 
 # Check if SSL files exist before adding them to uvicorn command
 SSL_ARGS=""

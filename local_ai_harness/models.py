@@ -26,10 +26,10 @@ class ChatCompletionRequest(BaseModel):
 
 
 class MessagesRequest(BaseModel):
-    model: str
+    model: str | None = None
     messages: list[ChatMessage]
-    system: str | None = None
-    max_tokens: int
+    system: str | list[Any] | None = None
+    max_tokens: int | None = None
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
