@@ -23,13 +23,18 @@ class MaasGateway:
             try:
                 response = await client.get(url, headers=self._headers())
                 response.raise_for_status()
-                return response.json()
+                data = response.json()
+                if "data" in data and isinstance(data["data"], list):
+                    for model in data["data"]:
+                        if "id" in model:
+                            model["id"] = f"{model['id']}-cwcode"
+                return data
             except Exception:
                 return {
                     "object": "list",
                     "data": [
                         {
-                            "id": self.config.default_model,
+                            "id": f"{self.config.default_model}-cwcode",
                             "object": "model",
                             "owned_by": "local-harness",
                         }

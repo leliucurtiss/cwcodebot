@@ -13,6 +13,7 @@ from .config import AppConfig, load_config
 from .context import ContextPacker, message_content_to_text
 from .gateway import MaasGateway
 from .memory import MemoryManager
+from .logger import setup_logging
 from .models import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -48,8 +49,37 @@ def print_messages(messages, label):
     # Print Total requests total character size
     # print(f"INFO: Total {label}s: {len(messages)} with {total_char_size} chars")
 
+class LoggingMiddleware:
+    def __init__(self, app, logger):
+        self.app = app
+        self.logger = logger
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope["method"]
+        path = scope["path"]
+        
+        status_code = [None]
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status_code[0] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as e:
+            self.logger.error(f"Request failed: {method} {path} - Error: {e}")
+            raise e
+        finally:
+            if status_code[0] and status_code[0] >= 400:
+                self.logger.error(f"Error Response: {method} {path} - Status: {status_code[0]}")
+
 def create_app(config_path: str | None = None, config: AppConfig | None = None, gateway: MaasGateway | None = None) -> FastAPI:
     cfg = config or load_config(config_path)
+    logger = setup_logging(cfg.log_level)
     storage = Storage(cfg.storage.sqlite_path)
     workspace = WorkspaceReader(cfg.workspace.root, cfg.context.max_file_bytes)
     context_builder = ContextPacker(cfg.context, workspace)
@@ -58,6 +88,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     maas = gateway or MaasGateway(cfg.maas)
 
     app = FastAPI(title="Local Code Assistant Harness", version="0.1.0")
+    app.add_middleware(LoggingMiddleware, logger=logger)
     app.state.config = cfg
     app.state.storage = storage
     app.state.workspace = workspace
@@ -65,33 +96,6 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     app.state.session_manager = session_manager
     app.state.memory_manager = memory_manager
     app.state.gateway = maas
-
-    @app.middleware("http")
-    async def log_requests(request: Request, call_next):
-        # Store request details in case we need to log them on error
-        method = request.method
-        url = request.url
-        headers = dict(request.headers)
-        
-        body = await request.body()
-        async def receive():
-            return {"type": "http.request", "body": body}
-        request._receive = receive
-        
-        response = await call_next(request)
-        
-        # Only print detailed logs for errors (status >= 400)
-        if response.status_code >= 400:
-            print(f"\\n--- Error Request ---")
-            print(f"Method: {method}")
-            print(f"URL: {url}")
-            print(f"Headers: {headers}")
-            if body:
-                print(f"Body: {body[:1000].decode('utf-8', errors='replace')}...")
-            print(f"Response Status: {response.status_code}")
-            print(f"--- End Error Request ---\\n")
-            
-        return response
 
     @app.get("/v1/oauth/hello")
     @app.get("/oauth/hello")
@@ -160,6 +164,14 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     async def models() -> dict[str, Any]:
         return await maas.list_models()
 
+    @app.head("/v1/models")
+    async def models_head():
+        """
+        HEAD request handler for /v1/models.
+        """
+        return await maas.list_models()
+        return Response(status_code=200)
+
     @app.get("/v1/api/hello")
     @app.get("/api/hello")
     async def api_hello():
@@ -210,14 +222,14 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                 context_files or []
             )
         except ValueError as e:
-            print(f"Context building error: {e}")
+            logger.error(f"Context building error: {e}")
             raise
 
         # Circuit Breaker: Detect repetition in the built context
         from .context import detect_repetition
         is_repeated, reason = detect_repetition(built.messages)
         if is_repeated:
-            print(f"DEBUG: [Circuit Breaker] Repetition detected! Reason: {reason}. Injecting warning.")
+            logger.debug(f"[Circuit Breaker] Repetition detected! Reason: {reason}. Injecting warning.")
             built.messages.append({
                 "role": "system", 
                 "content": "Warning: You are repeating yourself. Stop performing the same action and try a different approach or summarize your findings."
@@ -272,7 +284,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
         # Return immediately for Ghost empty autocomp
         if not prompt or not prompt.strip():
-            print(f"INFO: [Autocomp] Return immediately without Calling MAAS: with request (len:{len(prompt)} prompt: {prompt[:100]}", flush=True)
+            logger.info(f"[Autocomp] Return immediately without Calling MAAS: with request (len:{len(prompt)} prompt: {prompt[:100]}")
             return {
                 "id": f"cmpl-{uuid.uuid4().hex[:12]}",
                 "object": "text_completion",
@@ -304,16 +316,16 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         }
         
       
-        print(f"INFO: [Autocomp] Calling MAAS with request (len:{len(prompt)} prompt: {prompt[:50]}")
+        logger.info(f"[Autocomp] Calling MAAS with request (len:{len(prompt)} prompt: {prompt[:50]}")
         try:
             response = await maas.chat_completion(chat_payload)
         except Exception as e:
-            print(f"ERROR: [Route] ERROR calling MAAS: {str(e)}")
+            logger.error(f"[Route] ERROR calling MAAS: {str(e)}")
             raise HTTPException(status_code=500, detail=f"MAAS Gateway Error: {str(e)}")
         
         # Extract the content
         assistant_text = _extract_assistant_text(response)
-        print(f"INFO: [Autocomp] Received response from MAAS: {assistant_text[:50]}",flush=True)
+        logger.info(f"[Autocomp] Received response from MAAS: {assistant_text[:50]}")
         
         # Return in OpenAI completions format
         return {
@@ -358,7 +370,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             # print(f"INFO: Param total:{paramSize} chars")
 
             total_payload_size = len(json.dumps(payload))
-            print(f"INFO: Total payload size: {total_payload_size} characters")
+            logger.info(f"Total payload size: {total_payload_size} characters")
 
             # print(f"      SYS: {str(payload['messages'])[4800:4880]}")
             # This prints hyperparameters like temperature, top_p, etc.
@@ -439,7 +451,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                     from .context import detect_repetition
                                     is_repeated, reason = detect_repetition([{"role": "assistant", "content": pending_reasoning}])
                                     if is_repeated:
-                                        print(f"CRITICAL: [Circuit Breaker] Repetition detected in reasoning! Breaking stream.")
+                                        logger.critical(f"[Circuit Breaker] Repetition detected in reasoning! Breaking stream.")
                                         # We can't easily "reset" the MAAS call from here, but we can stop the stream
                                         # and send a final warning to the user/client.
                                         yield f"data: {json.dumps({'choices': [{'delta': {'content': '\\n\\n[Circuit Breaker: Repetition detected. Stopping generation.]'}}]})}\n\n".encode("utf-8")
@@ -458,7 +470,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                         pending_reasoning = ""
                                 
                                 if not thought_header_printed:
-                                    print(f"\n--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ", flush=True)
+                                    logger.info(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
                                     thought_header_printed = True
 
                             # 2. Handle Native Tool Calls (Pass-through)
@@ -476,7 +488,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                     from .context import detect_repetition
                                     is_repeated, reason =  detect_repetition([{"role": "assistant", "content": pending_content}])
                                     if is_repeated:
-                                        print(f"CRITICAL: [Circuit Breaker] Repetition detected in content! Breaking stream.")
+                                        logger.critical(f"[Circuit Breaker] Repetition detected in content! Breaking stream.")
                                         yield f"data: {json.dumps({'choices': [{'delta': {'content': '\\n\\n[Circuit Breaker: Repetition detected. Stopping generation.]'}}]})}\n\n".encode("utf-8")
                                         return
                                 # --- REPETITION DETECTION END ---
@@ -505,7 +517,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                             # 3. Handle Finish Reason
                             if choice.get("finish_reason") is not None:
                                 if text_tool_call: 
-                                    print(f"DEBUG: We are finishing with tool call {text_tool_call}")
+                                    logger.debug(f"We are finishing with tool call {text_tool_call}")
 
                                 # 3.1 Handle text_tool_call in reasoning
                                 if text_tool_call_reasoning:
@@ -584,7 +596,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         """
         # 1. Translate Anthropic request to internal format
         # Anthropic separates system prompt from messages
-        print(f"This is message from Claude {req.messages}")
+        logger.debug(f"This is message from Claude {req.messages}")
         internal_messages = list(req.messages)
         if req.system:
             # We prepend the system prompt to the messages list for our ContextBuilder

@@ -62,6 +62,7 @@ class AppConfig:
     context: ContextConfig
     workspace: WorkspaceConfig
     storage: StorageConfig
+    log_level: str = "INFO"
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -112,4 +113,5 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         storage=StorageConfig(
             sqlite_path=Path(storage.get("sqlite_path", "./data/harness.db")).expanduser(),
         ),
+        log_level=data.get("log_level", "INFO"),
     )
