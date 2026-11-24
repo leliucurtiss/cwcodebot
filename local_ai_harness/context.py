@@ -16,14 +16,15 @@ def message_content_to_text(content: Any) -> str:
         return content
     return str(content)
 
-def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) -> bool:
+def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) -> tuple[bool, str | None]:
     """
     Circuit Breaker: Detects if the assistant is repeating itself.
     Checks for both turn-level repetition and internal message looping.
+    Returns (is_repeating, reason).
     """
     assistant_msgs = [m["content"] for m in messages if m["role"] == "assistant"]
     if not assistant_msgs:
-        return False
+        return False, None
     
     last_msg = assistant_msgs[-1].lower()
 
@@ -31,9 +32,9 @@ def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) ->
     
     # A. Character-level repetition (e.g., "thoughtthoughtthought" or "aaaaaaaa")
     import re
-    # Matches any sequence of 3+ characters that repeats 3 or more times consecutively
-    if re.search(r'(.{2,})\1{2,}', last_msg):
-        return True
+    match = re.search(r'(.{2,})\1{4,}', last_msg)
+    if match and match.group(1).strip():
+        return True, f"Character-level repetition detected: '{match.group(1)}' repeats"
 
     # B. Word-level repetition (n-grams)
     words = last_msg.split()
@@ -45,11 +46,11 @@ def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) ->
         
         for seq in set(sequences):
             if sequences.count(seq) >= 3:
-                return True
+                return True, f"Word-level repetition detected: sequence '{seq}' repeats {sequences.count(seq)} times"
 
     # 2. Turn-level Repetition Detection (Inter-message loop)
     if len(assistant_msgs) < 2:
-        return False
+        return False, None
     
     m1 = last_msg
     m2 = assistant_msgs[-2].lower()
@@ -60,7 +61,10 @@ def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) ->
     union = len(set1.union(set2))
     
     similarity = intersection / union if union > 0 else 0
-    return similarity > threshold
+    if similarity > threshold:
+        return True, f"Turn-level similarity too high: {similarity:.2f} (threshold: {threshold})"
+    
+    return False, None
 
 @dataclass
 class ContextBuildResult:

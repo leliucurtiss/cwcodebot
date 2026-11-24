@@ -68,10 +68,26 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
     # @app.middleware("http")
     # async def log_requests(request: Request, call_next):
-    #     print(f"DEBUG: [Request] {request.method} {request.url.path}")
-    #     # print(f"DEBUG: [Headers] {request.headers}")
+    #     print(f"\\n--- Incoming Request ---")
+    #     print(f"Method: {request.method}")
+    #     print(f"URL: {request.url}")
+    #     print(f"Headers: {dict(request.headers)}")
+        
+    #     body = await request.body()
+    #     if body:
+    #         # Print only a small portion of the body to avoid log bloat
+    #         print(f"Body: {body[:1000].decode('utf-8', errors='replace')}...")
+    #     else:
+    #         print(f"Body: [Empty]")
+        
+    #     # We must wrap the body back into the request so subsequent handlers can read it
+    #     async def receive():
+    #         return {"type": "http.request", "body": body}
+    #     request._receive = receive
+        
     #     response = await call_next(request)
-    #     print(f"DEBUG: [Response] {request.method} {request.url.path} -> {response.status_code}")
+    #     print(f"Response Status: {response.status_code}")
+    #     print(f"--- End Request ---\\n")
     #     return response
 
     @app.get("/health")
@@ -88,9 +104,25 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         return await maas.list_models()
 
     @app.get("/v1/api/hello")
+    @app.get("/api/hello")
     async def api_hello():
         """Handshake endpoint for Claude Code / Anthropic compatibility check."""
-        return {"status": "ok"}
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
+        return Response(
+            content=json.dumps({"status": "ok"}),
+            media_type="application/json",
+            headers={
+                "x-amzn-request-id": uuid.uuid4().hex,
+                "server": "cloudflare",
+                "date": now,
+                "content-type": "application/json",
+                "connection": "keep-alive",
+                "access-control-allow-origin": "*",
+                "access-control-allow-methods": "GET, POST, HEAD, OPTIONS",
+                "access-control-allow-headers": "*"
+            }
+        )
 
     async def _prepare_chat_context(
         messages: list[ChatMessage],
@@ -120,8 +152,9 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
         # Circuit Breaker: Detect repetition in the built context
         from .context import detect_repetition
-        if detect_repetition(built.messages):
-            print("DEBUG: [Circuit Breaker] Repetition detected! Injecting warning.")
+        is_repeated, reason = detect_repetition(built.messages)
+        if is_repeated:
+            print(f"DEBUG: [Circuit Breaker] Repetition detected! Reason: {reason}. Injecting warning.")
             built.messages.append({
                 "role": "system", 
                 "content": "Warning: You are repeating yourself. Stop performing the same action and try a different approach or summarize your findings."
@@ -138,6 +171,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
     # HEAD handler
     @app.head("/v1/api/hello")
+    @app.head("/api/hello")
     async def api_hello_head():
         """
         HEAD request handler — returns only headers, no body.
@@ -324,7 +358,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 # --- REPETITION DETECTION START ---
                                 if len(pending_reasoning) > 100:
                                     from .context import detect_repetition
-                                    if detect_repetition([{"role": "assistant", "content": pending_reasoning}]):
+                                    is_repeated, reason = detect_repetition([{"role": "assistant", "content": pending_reasoning}])
+                                    if is_repeated:
                                         print(f"CRITICAL: [Circuit Breaker] Repetition detected in reasoning! Breaking stream.")
                                         # We can't easily "reset" the MAAS call from here, but we can stop the stream
                                         # and send a final warning to the user/client.
@@ -344,9 +379,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                         pending_reasoning = ""
                                 
                                 if not thought_header_printed:
-                                    print("\n--- Thinking ---", flush=True)
+                                    print(f"\n--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ", flush=True)
                                     thought_header_printed = True
-                                    #print(f"DEBUG: reasoning len {len(reasoning)} of {reasoning[0:50]}",  end="", flush=True)
 
                             # 2. Handle Native Tool Calls (Pass-through)
                             tool_calls = delta.get("tool_calls")
@@ -361,7 +395,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 # --- REPETITION DETECTION START ---
                                 if len(pending_content) > 100:
                                     from .context import detect_repetition
-                                    if detect_repetition([{"role": "assistant", "content": pending_content}]):
+                                    is_repeated, reason =  detect_repetition([{"role": "assistant", "content": pending_content}])
+                                    if is_repeated:
                                         print(f"CRITICAL: [Circuit Breaker] Repetition detected in content! Breaking stream.")
                                         yield f"data: {json.dumps({'choices': [{'delta': {'content': '\\n\\n[Circuit Breaker: Repetition detected. Stopping generation.]'}}]})}\n\n".encode("utf-8")
                                         return
@@ -458,6 +493,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         return response
 
     @app.post("/v1/messages")
+    @app.post("/messages")
     async def messages(
         req: MessagesRequest,
         x_harness_project_id: str | None = Header(default=None),
@@ -491,34 +527,63 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         if req.stream:
             async def anthropic_stream() -> Any:
                 # We wrap the OpenAI stream into Anthropic SSE events
-                # Simplified: just send content_block_delta
+                msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+                
+                # 1. message_start
+                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'role': 'assistant', 'model': payload['model']}})}\n\n".encode("utf-8")
+                
+                # 2. content_block_start (assuming first block is text)
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
+
+                block_index = 0
+                current_block_type = "text"
+                
                 async for chunk in maas.stream_chat_completion(payload):
-                    # This is a bit complex because maas.stream_chat_completion 
-                    # returns OpenAI SSE bytes. We need to parse them and re-emit.
-                    # For now, let's just pass through the content if we can.
-                    # A better way would be to use the same logic as chat_completions stream
-                    # but emit Anthropic events.
+                    if not chunk.startswith(b"data: "):
+                        continue
                     
-                    # To keep it simple for the first iteration, we'll just 
-                    # yield the raw chunk if it's already SSE, but Claudecode 
-                    # expects specific event types.
+                    line = chunk.decode("utf-8").strip()
+                    if line == "data: [DONE]":
+                        # Finalize blocks and message
+                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}})}\n\n".encode("utf-8")
+                        yield b"event: message_stop\ndata: {}\n\n"
+                        return
                     
-                    # Let's implement a basic translation of the OpenAI SSE to Anthropic SSE
-                    if chunk.startswith(b"data: "):
-                        line = chunk.decode("utf-8").strip()
-                        if line == "data: [DONE]":
-                            yield b"event: message_stop\ndata: {}\n\n"
-                            continue
+                    try:
+                        data = json.loads(line[6:])
+                        delta = data.get("choices", [{}])[0].get("delta", {})
                         
-                        try:
-                            data = json.loads(line[6:])
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'delta': {'type': 'text_delta', 'text': content}})}\n\n".encode("utf-8")
-                        except:
-                            continue
-                    yield chunk
+                        # Handle Reasoning (Thinking)
+                        reasoning = delta.get("reasoning_content")
+                        if reasoning:
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': reasoning}})}\n\n".encode("utf-8")
+
+                        # Handle Content
+                        content = delta.get("content")
+                        if content:
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n".encode("utf-8")
+                        
+                        # Handle Tool Calls (Native OpenAI format)
+                        tool_calls = delta.get("tool_calls")
+                        if tool_calls:
+                            if current_block_type == "text":
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                                block_index += 1
+                                current_block_type = "tool_use"
+                            
+                            for tc in tool_calls:
+                                tc_id = tc.get("id", f"tool_{uuid.uuid4().hex[:12]}")
+                                name = tc.get("function", {}).get("name", "unknown")
+                                args = tc.get("function", {}).get("arguments", "")
+                                
+                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': name, 'input': {}}})}\n\n".encode("utf-8")
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n".encode("utf-8")
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                                block_index += 1
+                    except Exception as e:
+                        print(f"DEBUG: SSE Translation Error: {e}")
+                        continue
                 return
 
             return StreamingResponse(anthropic_stream(), media_type="text/event-stream")
@@ -541,36 +606,35 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             "usage": {"input_tokens": 0, "output_tokens": 0}
         }
 
-    @app.post("/harness/projects")
-
+    @app.post("/v1/projects")
     async def create_project(req: ProjectCreateRequest) -> dict[str, Any]:
         project_id = req.project_id or f"proj-{uuid.uuid4().hex[:12]}"
         root_path = str(Path(req.root_path).expanduser().resolve()) if req.root_path else str(cfg.workspace.root)
         project = storage.get_or_create_project(project_id, root_path, req.memory_summary)
         return project.__dict__
 
-    @app.get("/harness/projects/{project_id}")
+    @app.get("/v1/projects/{project_id}")
     async def get_project(project_id: str) -> dict[str, Any]:
         project = storage.get_project(project_id)
         if not project:
             raise HTTPException(404, "Project not found")
         return project.__dict__
 
-    @app.put("/harness/projects/{project_id}/memory")
+    @app.put("/v1/projects/{project_id}/memory")
     async def update_project_memory(project_id: str, req: ProjectMemoryUpdate) -> dict[str, Any]:
         if not storage.get_project(project_id):
             raise HTTPException(404, "Project not found")
         project = memory_manager.update_project_memory(project_id, req.memory_summary)
         return project.__dict__
 
-    @app.post("/harness/conversations")
+    @app.post("/v1/conversations")
     async def create_conversation(req: ConversationCreateRequest) -> dict[str, Any]:
         if not storage.get_project(req.project_id):
             raise HTTPException(404, "Project not found")
         conv = storage.get_or_create_conversation(req.conversation_id, req.project_id)
         return conv.__dict__
 
-    @app.get("/harness/conversations/{conversation_id}")
+    @app.get("/v1/conversations/{conversation_id}")
     async def get_conversation(conversation_id: str) -> dict[str, Any]:
         conv = storage.get_conversation(conversation_id)
         if not conv:
@@ -578,14 +642,14 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         messages = [msg.__dict__ for msg in storage.list_messages(conversation_id, limit=500)]
         return {"conversation": conv.__dict__, "messages": messages}
 
-    @app.put("/harness/conversations/{conversation_id}/memory")
+    @app.put("/v1/conversations/{conversation_id}/memory")
     async def update_conversation_memory(conversation_id: str, req: ConversationMemoryUpdate) -> dict[str, Any]:
         if not storage.get_conversation(conversation_id):
             raise HTTPException(404, "Conversation not found")
         conv = memory_manager.update_conversation_memory(conversation_id, req.memory_summary)
         return conv.__dict__
 
-    @app.post("/harness/debug/context")
+    @app.post("/v1/debug/context")
     async def debug_context(req: DebugContextRequest) -> dict[str, Any]:
         session = session_manager.resolve(req.project_id, req.conversation_id)
         memory = memory_manager.load(session.project, session.conversation)
@@ -622,7 +686,7 @@ def _content_sse(content: str) -> bytes:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
 def _tool_calls_sse(tool_calls: Any) -> bytes:
-    # print(f"INFO: native tool call",tool_calls)
+    print(f"INFO: {tool_calls[:50]}")
     event = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -631,7 +695,7 @@ def _translate_tool_call(raw_text: str) -> tuple[str | None, str]:
     Translates MaaS text format into OpenAI tool call SSE.
     Returns (translated_json_or_none, remaining_text).
     """
-    print(f"DEBUG: translating tool calls: \n")
+    print(f"DEBUG: translating tool calls: \n{raw_text[:50]}")
 
     # --- Strategy 0: Action/Action Input format (ReAct style) ---
     if "Action:" in raw_text and "Action Input:" in raw_text:
