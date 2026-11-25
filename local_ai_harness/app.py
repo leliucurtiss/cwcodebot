@@ -169,7 +169,6 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         """
         HEAD request handler for /v1/models.
         """
-        return await maas.list_models()
         return Response(status_code=200)
 
     @app.get("/v1/api/hello")
@@ -470,7 +469,8 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                         pending_reasoning = ""
                                 
                                 if not thought_header_printed:
-                                    logger.info(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
+                                    # print(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
+                                    # logger.info(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
                                     thought_header_printed = True
 
                             # 2. Handle Native Tool Calls (Pass-through)
@@ -577,6 +577,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         response = await maas.chat_completion(payload)
+        logger.debug(f"Raw MAAS response: {json.dumps(response)}")
         # print(f"Response: {response}")  # Print the non-streaming response
         assistant_text = _extract_assistant_text(response)
         if assistant_text:
@@ -665,14 +666,19 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                 current_block_type = "tool_use"
                             
                             for tc in tool_calls:
-                                tc_id = tc.get("id", f"tool_{uuid.uuid4().hex[:12]}")
-                                name = tc.get("function", {}).get("name", "unknown")
-                                args = tc.get("function", {}).get("arguments", "")
+                                tc_id = tc.get("id")
+                                if tc_id:
+                                    name = tc.get("function", {}).get("name", "unknown")
+                                    print(f"DEBUG: Sending content_block_start for tool {name} (id: {tc_id}) at index {block_index}")
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': name, 'input': {}}})}\n\n".encode("utf-8")
+                                    block_index += 1
                                 
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': name, 'input': {}}})}\n\n".encode("utf-8")
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n".encode("utf-8")
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
-                                block_index += 1
+                                args = tc.get("function", {}).get("arguments", "")
+                                if args:
+                                    # The block index for this tool call is the one just started, or the current one if it was started in a previous chunk
+                                    current_tool_idx = block_index - 1 if tc_id else block_index
+                                    print(f"DEBUG: Sending content_block_delta for tool at index {current_tool_idx}: {args[:50]}...")
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_tool_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n".encode("utf-8")
                     except Exception as e:
                         print(f"DEBUG: SSE Translation Error: {e}")
                         continue
@@ -682,16 +688,31 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
 
         # Non-streaming response
         response = await maas.chat_completion(payload)
-        assistant_text = _extract_assistant_text(response)
+        
+        message = response.get("choices", [{}])[0].get("message", {})
+        assistant_text = message.get("content") or ""
+        
+        content_blocks = []
         if assistant_text:
+            content_blocks.append({"type": "text", "text": assistant_text})
             storage.add_message(session.conversation.id, "assistant", assistant_text)
         
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            for tc in tool_calls:
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id"),
+                    "name": tc.get("function", {}).get("name"),
+                    "input": json.loads(tc.get("function", {}).get("arguments", "{}")) if isinstance(tc.get("function", {}).get("arguments"), str) else tc.get("function", {}).get("arguments", {})
+                })
+
         # Translate OpenAI response to Anthropic format
         return {
             "id": f"msg_{uuid.uuid4().hex[:12]}",
             "type": "message",
             "role": "assistant",
-            "content": [{"type": "text", "text": assistant_text}],
+            "content": content_blocks,
             "model": payload["model"],
             "stop_reason": "end_turn",
             "stop_sequence": None,
@@ -788,7 +809,7 @@ def _content_sse(content: str) -> bytes:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
 def _tool_calls_sse(tool_calls: Any) -> bytes:
-    print(f"INFO: {tool_calls[:50]}")
+    # print(f"INFO: Native {tool_calls[:50]}")
     event = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -944,6 +965,27 @@ def _translate_tool_call(raw_text: str) -> tuple[str | None, str]:
         # For Strategy 2, we'll just return the remaining text as empty for now 
         # or try to calculate it.
         return _build_openai_tool_call(tool_name, args), raw_text[last_line_end:]
+
+    # --- Strategy 4: JSON Array of Tool Calls ---
+    # This matches: json [ { "tool": "...", "parameters": { ... } } ]
+    if raw_text.strip().startswith("json [") or raw_text.strip().startswith("["):
+        try:
+            # Remove "json " prefix if present
+            json_str = raw_text.strip()
+            if json_str.startswith("json "):
+                json_str = json_str[5:].strip()
+            
+            data = json.loads(json_str)
+            if isinstance(data, list) and len(data) > 0:
+                first_tool = data[0]
+                tool_name = first_tool.get("tool") or first_tool.get("name")
+                args = first_tool.get("parameters") or first_tool.get("arguments") or {}
+                if tool_name:
+                    # For simplicity, we return the first tool call and the rest of the text
+                    # In a real scenario, we might want to handle multiple tool calls
+                    return _build_openai_tool_call(tool_name, args), ""
+        except json.JSONDecodeError:
+            pass
 
     # --- Strategy 3: tool_name{json_args} ---
     # This matches: tool_name{...} or tool\ntool_name{...}

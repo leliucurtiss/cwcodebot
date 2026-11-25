@@ -21,6 +21,9 @@ def setup_logging(log_level: str = "INFO", log_file: str | Path | None = None):
         handlers=handlers,
     )
     
+    # Silence httpx to avoid verbose request/response logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    
     # Set a default logger for the application
     logger = logging.getLogger("local_ai_harness")
     return logger
