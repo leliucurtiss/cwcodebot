@@ -30,7 +30,7 @@ from .storage import Storage
 from .workspace import WorkspaceReader
 
 # Example function for printing messages
-def print_messages(messages, label):
+def print_messages_length(messages, label):
     total_char_size = 0
     for i, message in enumerate(messages):
         # Handle the case where content is a list or string
@@ -349,7 +349,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         x_harness_conversation_id: str | None = Header(default=None),
     ) -> Any:
         # # Print the messages and their length
-        print_messages(req.messages,"request")
+        print_messages_length(req.messages,"request")
 
         session, built_messages, _ = await _prepare_chat_context(
             req.messages, x_harness_project_id, x_harness_conversation_id, req.context_files
@@ -369,7 +369,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             # print(f"INFO: Param total:{paramSize} chars")
 
             total_payload_size = len(json.dumps(payload))
-            logger.info(f"Total payload size: {total_payload_size} characters")
+            print(f"INFO:   Total payload size: {total_payload_size} characters")
 
             # print(f"      SYS: {str(payload['messages'])[4800:4880]}")
             # This prints hyperparameters like temperature, top_p, etc.
@@ -384,12 +384,9 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                 text_tool_call_reasoning = False
 
                 # Markers for tool detection
-                tool_markers = ["TOOL_NAME:", "```tool", "tool_code", "tool_call", "tool\n", "Action:", "Action Input:"]
+                tool_markers = ["TOOL_NAME:", "```tool", "tool_code"]
                 # Regex for tool_name{...} format
-                tool_name_brace_pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*\s*\{'
-                # Regex for tool_name(...) format
-                tool_name_paren_pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*\s*\('
-                # tool_markers = ["TOOL_NAME:", "```tool", "<tool_code>", "<function_name>"]
+                # tool_name_brace_pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*\s*\{'
 
                 async for chunk in maas.stream_chat_completion(payload):
                     buffer += chunk
@@ -450,7 +447,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                     from .context import detect_repetition
                                     is_repeated, reason = detect_repetition([{"role": "assistant", "content": pending_reasoning}])
                                     if is_repeated:
-                                        logger.critical(f"[Circuit Breaker] Repetition detected in reasoning! Breaking stream.")
+                                        logger.critical(f"Repetition detected in reasoning! Breaking stream.")
                                         # We can't easily "reset" the MAAS call from here, but we can stop the stream
                                         # and send a final warning to the user/client.
                                         yield f"data: {json.dumps({'choices': [{'delta': {'content': '\\n\\n[Circuit Breaker: Repetition detected. Stopping generation.]'}}]})}\n\n".encode("utf-8")
@@ -469,7 +466,6 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                         pending_reasoning = ""
                                 
                                 if not thought_header_printed:
-                                    # print(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
                                     # logger.info(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
                                     thought_header_printed = True
 
@@ -498,7 +494,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                                     stripped = pending_content.lstrip()
 
                                     # 2. Check if the stripped content starts with any of our markers
-                                    if any(stripped.startswith(m) for m in tool_markers) or re.match(tool_name_brace_pattern, stripped):
+                                    if any(stripped.startswith(m) for m in tool_markers):
                                         text_tool_call = True
                                     # 3. Buffer if it starts with any character that COULD be a marker (T, `, or <)
                                     elif not (stripped.startswith('T') or stripped.startswith('`') or stripped.startswith('<')):
@@ -596,11 +592,9 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         Anthropic Messages API wrapper for Claudecode compatibility.
         """
         # 1. Translate Anthropic request to internal format
-        # Anthropic separates system prompt from messages
         logger.debug(f"This is message from Claude {req.messages}")
         internal_messages = list(req.messages)
         if req.system:
-            # We prepend the system prompt to the messages list for our ContextBuilder
             internal_messages.insert(0, ChatMessage(role="system", content=req.system))
 
         # 2. Prepare context and save messages
@@ -609,36 +603,47 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         )
 
         # 3. Build payload for MAAS (OpenAI format)
+        # We use a selective reconstruction to avoid 400 Bad Request from MAAS
+        # while preserving the 'tools' and other critical parameters.
         payload = {
-            "model": req.model or cfg.maas.default_model,
+            "model": cfg.maas.default_model,
             "messages": built_messages,
             "max_tokens": req.max_tokens or cfg.context.model_context_max,
             "temperature": req.temperature,
             "stream": req.stream,
         }
+        
+        # Extract tools from model_extra if present (Claude Code sends them here)
+        # # Since MessagesRequest has extra="allow", undefined fields go into model_extra
+        # model_extra = getattr(req, 'model_extra', {})
+        # if model_extra and 'tools' in model_extra:
+        #     payload["tools"] = model_extra["tools"]
 
         if req.stream:
             async def anthropic_stream() -> Any:
-                # We wrap the OpenAI stream into Anthropic SSE events
                 msg_id = f"msg_{uuid.uuid4().hex[:12]}"
-                
+                block_index = 0
+                current_block_type = "text"
+                active_tools = {} # Map OpenAI tool index -> Anthropic block_index
+
                 # 1. message_start
                 yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'role': 'assistant', 'model': payload['model']}})}\n\n".encode("utf-8")
                 
-                # 2. content_block_start (assuming first block is text)
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
+                # 2. Initial text block
+                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
 
-                block_index = 0
-                current_block_type = "text"
-                
                 async for chunk in maas.stream_chat_completion(payload):
                     if not chunk.startswith(b"data: "):
                         continue
                     
                     line = chunk.decode("utf-8").strip()
                     if line == "data: [DONE]":
-                        # Finalize blocks and message
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                        # Close all remaining blocks
+                        for idx in sorted(active_tools.keys()):
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': active_tools[idx]})}\n\n".encode("utf-8")
+                        if current_block_type == "text":
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                        
                         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}})}\n\n".encode("utf-8")
                         yield b"event: message_stop\ndata: {}\n\n"
                         return
@@ -647,38 +652,46 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                         data = json.loads(line[6:])
                         delta = data.get("choices", [{}])[0].get("delta", {})
                         
-                        # Handle Reasoning (Thinking)
+                        # --- Handle Text or Reasoning ---
                         reasoning = delta.get("reasoning_content")
-                        if reasoning:
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': reasoning}})}\n\n".encode("utf-8")
-
-                        # Handle Content
                         content = delta.get("content")
-                        if content:
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': content}})}\n\n".encode("utf-8")
                         
-                        # Handle Tool Calls (Native OpenAI format)
+                        if reasoning or content:
+                            if current_block_type != "text":
+                                # Close all active tools before starting a new text block
+                                for idx in sorted(active_tools.keys()):
+                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': active_tools[idx]})}\n\n".encode("utf-8")
+                                active_tools.clear()
+                                
+                                block_index += 1
+                                current_block_type = "text"
+                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
+                            
+                            text_delta = reasoning or content
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_delta}})}\n\n".encode("utf-8")
+
+                        # --- Handle Native Tool Calls ---
                         tool_calls = delta.get("tool_calls")
                         if tool_calls:
-                            if current_block_type == "text":
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
-                                block_index += 1
-                                current_block_type = "tool_use"
-                            
                             for tc in tool_calls:
-                                tc_id = tc.get("id")
-                                if tc_id:
-                                    name = tc.get("function", {}).get("name", "unknown")
-                                    print(f"DEBUG: Sending content_block_start for tool {name} (id: {tc_id}) at index {block_index}")
-                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': name, 'input': {}}})}\n\n".encode("utf-8")
+                                idx = tc.get("index")
+                                if idx not in active_tools:
+                                    if current_block_type == "text":
+                                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                                        current_block_type = "none"
+                                    
                                     block_index += 1
+                                    active_tools[idx] = block_index
+                                    current_block_type = "tool_use"
+                                    
+                                    name = tc.get("function", {}).get("name", "unknown")
+                                    tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': name, 'input': {}}})}\n\n".encode("utf-8")
                                 
                                 args = tc.get("function", {}).get("arguments", "")
                                 if args:
-                                    # The block index for this tool call is the one just started, or the current one if it was started in a previous chunk
-                                    current_tool_idx = block_index - 1 if tc_id else block_index
-                                    print(f"DEBUG: Sending content_block_delta for tool at index {current_tool_idx}: {args[:50]}...")
-                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_tool_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n".encode("utf-8")
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': active_tools[idx], 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n".encode("utf-8")
+                                    
                     except Exception as e:
                         print(f"DEBUG: SSE Translation Error: {e}")
                         continue
@@ -707,7 +720,6 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
                     "input": json.loads(tc.get("function", {}).get("arguments", "{}")) if isinstance(tc.get("function", {}).get("arguments"), str) else tc.get("function", {}).get("arguments", {})
                 })
 
-        # Translate OpenAI response to Anthropic format
         return {
             "id": f"msg_{uuid.uuid4().hex[:12]}",
             "type": "message",
@@ -820,215 +832,215 @@ def _translate_tool_call(raw_text: str) -> tuple[str | None, str]:
     """
     print(f"DEBUG: translating tool calls: \n{raw_text[:50]}")
 
-    # --- Strategy 0: Action/Action Input format (ReAct style) ---
-    if "Action:" in raw_text and "Action Input:" in raw_text:
-        try:
-            action_match = re.search(r"Action:\s*(.*?)\n", raw_text)
-            input_match = re.search(r"Action Input:\s*(.*?)(?:\n\n|\Z)", raw_text, re.DOTALL)
-            if action_match and input_match:
-                tool_name = action_match.group(1).strip()
-                args_str = input_match.group(1).strip()
-                try:
-                    args = json.loads(args_str)
-                except json.JSONDecodeError:
-                    args = {"input": args_str}
+    # # --- Strategy 0: Action/Action Input format (ReAct style) ---
+    # if "Action:" in raw_text and "Action Input:" in raw_text:
+    #     try:
+    #         action_match = re.search(r"Action:\s*(.*?)\n", raw_text)
+    #         input_match = re.search(r"Action Input:\s*(.*?)(?:\n\n|\Z)", raw_text, re.DOTALL)
+    #         if action_match and input_match:
+    #             tool_name = action_match.group(1).strip()
+    #             args_str = input_match.group(1).strip()
+    #             try:
+    #                 args = json.loads(args_str)
+    #             except json.JSONDecodeError:
+    #                 args = {"input": args_str}
                 
-                end_pos = input_match.end()
-                return _build_openai_tool_call(tool_name, args), raw_text[end_pos:]
-        except Exception:
-            pass
+    #             end_pos = input_match.end()
+    #             return _build_openai_tool_call(tool_name, args), raw_text[end_pos:]
+    #     except Exception:
+    #         pass
 
-    # --- Strategy 1: XML-like format (<tool_code> or <tool_call>) ---
-    if any(m in raw_text for m in ["<tool_code>", "<tool_call>", "<function_name>"]):
-        # First, try the specific <function_name>/<parameters> format
-        try:
-            name_match = re.search(r"<function_name>\s*(.*?)\s*</function_name>", raw_text)
-            params_match = re.search(r"<parameters>\s*(.*?)\s*</parameters>", raw_text, re.DOTALL)
+    # # --- Strategy 1: XML-like format (<tool_code> or <tool_call>) ---
+    # if any(m in raw_text for m in ["<tool_code>", "<tool_call>", "<function_name>"]):
+    #     # First, try the specific <function_name>/<parameters> format
+    #     try:
+    #         name_match = re.search(r"<function_name>\s*(.*?)\s*</function_name>", raw_text)
+    #         params_match = re.search(r"<parameters>\s*(.*?)\s*</parameters>", raw_text, re.DOTALL)
             
-            if name_match and params_match:
-                tool_name = name_match.group(1).strip()
-                args_str = params_match.group(1).strip()
-                try:
-                    args = json.loads(args_str)
-                    # Find where the tool call ends to return remaining text
-                    end_pos = raw_text.find("</parameters>") + len("</parameters>")
-                    # If there's a closing </tool_call> or </tool_code>, skip that too
-                    for tag in ["tool_call", "tool_code"]:
-                        end_tag = f"</{tag}>"
-                        if end_tag in raw_text[end_pos:]:
-                            end_pos += raw_text[end_pos:].find(end_tag) + len(end_tag)
+    #         if name_match and params_match:
+    #             tool_name = name_match.group(1).strip()
+    #             args_str = params_match.group(1).strip()
+    #             try:
+    #                 args = json.loads(args_str)
+    #                 # Find where the tool call ends to return remaining text
+    #                 end_pos = raw_text.find("</parameters>") + len("</parameters>")
+    #                 # If there's a closing </tool_call> or </tool_code>, skip that too
+    #                 for tag in ["tool_call", "tool_code"]:
+    #                     end_tag = f"</{tag}>"
+    #                     if end_tag in raw_text[end_pos:]:
+    #                         end_pos += raw_text[end_pos:].find(end_tag) + len(end_tag)
                     
-                    return _build_openai_tool_call(tool_name, args), raw_text[end_pos:]
-                except json.JSONDecodeError:
-                    pass
-        except Exception:
-            pass
+    #                 return _build_openai_tool_call(tool_name, args), raw_text[end_pos:]
+    #             except json.JSONDecodeError:
+    #                 pass
+    #     except Exception:
+    #         pass
 
-        # Second, try JSON inside <tool_call> or <tool_code> tags
-        for tag in ["tool_call", "tool_code"]:
-            start_tag = f"<{tag}>"
-            end_tag = f"</{tag}>"
-            if start_tag in raw_text and end_tag in raw_text:
-                start_idx = raw_text.find(start_tag) + len(start_tag)
-                end_idx = raw_text.find(end_tag)
-                json_str = raw_text[start_idx:end_idx].strip()
-                try:
-                    data = json.loads(json_str)
-                    tool_name = data.get("command") or data.get("name")
-                    args = data.get("parameters") or data.get("arguments") or {}
-                    if tool_name:
-                        return _build_openai_tool_call(tool_name, args), raw_text[end_idx + len(end_tag):]
-                except json.JSONDecodeError:
-                    pass
+    #     # Second, try JSON inside <tool_call> or <tool_code> tags
+    #     for tag in ["tool_call", "tool_code"]:
+    #         start_tag = f"<{tag}>"
+    #         end_tag = f"</{tag}>"
+    #         if start_tag in raw_text and end_tag in raw_text:
+    #             start_idx = raw_text.find(start_tag) + len(start_tag)
+    #             end_idx = raw_text.find(end_tag)
+    #             json_str = raw_text[start_idx:end_idx].strip()
+    #             try:
+    #                 data = json.loads(json_str)
+    #                 tool_name = data.get("command") or data.get("name")
+    #                 args = data.get("parameters") or data.get("arguments") or {}
+    #                 if tool_name:
+    #                     return _build_openai_tool_call(tool_name, args), raw_text[end_idx + len(end_tag):]
+    #             except json.JSONDecodeError:
+    #                 pass
 
-    # --- Strategy 1: Try to extract JSON (Handles Format 2 & 3) ---
-    if any(m in raw_text for m in ["```tool"]) or raw_text.strip().startswith("{"):
-        try:
-            json_content = raw_text
-            # Remove leading markers
-            while json_content.startswith("```tool"):
-                json_content = json_content[len("```tool"):].lstrip()
-            if json_content.startswith("```"):
-                json_content = json_content[3:].lstrip()
+    # # --- Strategy 1: Try to extract JSON (Handles Format 2 & 3) ---
+    # if any(m in raw_text for m in ["```tool"]) or raw_text.strip().startswith("{"):
+    #     try:
+    #         json_content = raw_text
+    #         # Remove leading markers
+    #         while json_content.startswith("```tool"):
+    #             json_content = json_content[len("```tool"):].lstrip()
+    #         if json_content.startswith("```"):
+    #             json_content = json_content[3:].lstrip()
             
-            # Find the end of the JSON block
-            if json_content.endswith("```"):
-                json_content = json_content[:-3].rstrip()
+    #         # Find the end of the JSON block
+    #         if json_content.endswith("```"):
+    #             json_content = json_content[:-3].rstrip()
             
-            # We need to find where the JSON actually ends if there's trailing text
-            # A simple way is to try and parse it, and if it fails, try to find the last '}'
-            try:
-                data = json.loads(json_content)
-                # If it parsed, we need to know how much of the original raw_text was used
-                # This is tricky because of the stripping. 
-                # For simplicity, if it's a ```tool block, we assume it ends at the next ```
-                if "```tool" in raw_text:
-                    end_pos = raw_text.find("```", raw_text.find("```tool") + 7)
-                    if end_pos != -1:
-                        end_pos += 3
-                        return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), raw_text[end_pos:]
+    #         # We need to find where the JSON actually ends if there's trailing text
+    #         # A simple way is to try and parse it, and if it fails, try to find the last '}'
+    #         try:
+    #             data = json.loads(json_content)
+    #             # If it parsed, we need to know how much of the original raw_text was used
+    #             # This is tricky because of the stripping. 
+    #             # For simplicity, if it's a ```tool block, we assume it ends at the next ```
+    #             if "```tool" in raw_text:
+    #                 end_pos = raw_text.find("```", raw_text.find("```tool") + 7)
+    #                 if end_pos != -1:
+    #                     end_pos += 3
+    #                     return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), raw_text[end_pos:]
                 
-                # If it just started with '{', we find the matching '}'
-                if raw_text.strip().startswith("{"):
-                    # Very basic brace matching
-                    count = 0
-                    for i, char in enumerate(raw_text):
-                        if char == '{': count += 1
-                        elif char == '}': count -= 1
-                        if count == 0 and i > 0:
-                            return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), raw_text[i+1:]
+    #             # If it just started with '{', we find the matching '}'
+    #             if raw_text.strip().startswith("{"):
+    #                 # Very basic brace matching
+    #                 count = 0
+    #                 for i, char in enumerate(raw_text):
+    #                     if char == '{': count += 1
+    #                     elif char == '}': count -= 1
+    #                     if count == 0 and i > 0:
+    #                         return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), raw_text[i+1:]
                 
-                return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), ""
-            except json.JSONDecodeError:
-                pass
-        except Exception:
-            pass
+    #             return _build_openai_tool_call(data.get("command") or data.get("name"), data.get("parameters") or data.get("arguments") or {}), ""
+    #         except json.JSONDecodeError:
+    #             pass
+    #     except Exception:
+    #         pass
 
-    # --- Strategy 2: Line-by-Line Parsing (Handles Format 1) ---
-    tool_name = ""
-    args: dict[str, Any] = {}
-    current_arg_key: str | None = None
-    value_lines: list[str] = []
-    last_line_end = 0
+    # # --- Strategy 2: Line-by-Line Parsing (Handles Format 1) ---
+    # tool_name = ""
+    # args: dict[str, Any] = {}
+    # current_arg_key: str | None = None
+    # value_lines: list[str] = []
+    # last_line_end = 0
 
-    lines = raw_text.splitlines(keepends=True)
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("TOOL_NAME:"):
-            tool_name = stripped.removeprefix("TOOL_NAME:").strip()
-        elif stripped.startswith("BEGIN_ARG:"):
-            if current_arg_key is not None: break
-            current_arg_key = stripped.removeprefix("BEGIN_ARG:").strip()
-            if not current_arg_key: break
-            value_lines = []
-        elif stripped == "END_ARG":
-            if current_arg_key is None: break
-            raw_value = "\n".join(value_lines).strip()
-            try:
-                args[current_arg_key] = json.loads(raw_value)
-            except json.JSONDecodeError:
-                args[current_arg_key] = raw_value.strip('"')
-            current_arg_key = None
-            # We found a complete tool call if we have a name and args
-            if tool_name and args:
-                # Calculate where this ended
-                # This is approximate since we splitlines
-                # We'll just return the rest of the text from the current line
-                # But we need to know the index.
-                pass
-        elif current_arg_key is not None:
-            value_lines.append(line.strip())
+    # lines = raw_text.splitlines(keepends=True)
+    # for line in lines:
+    #     stripped = line.strip()
+    #     if stripped.startswith("TOOL_NAME:"):
+    #         tool_name = stripped.removeprefix("TOOL_NAME:").strip()
+    #     elif stripped.startswith("BEGIN_ARG:"):
+    #         if current_arg_key is not None: break
+    #         current_arg_key = stripped.removeprefix("BEGIN_ARG:").strip()
+    #         if not current_arg_key: break
+    #         value_lines = []
+    #     elif stripped == "END_ARG":
+    #         if current_arg_key is None: break
+    #         raw_value = "\n".join(value_lines).strip()
+    #         try:
+    #             args[current_arg_key] = json.loads(raw_value)
+    #         except json.JSONDecodeError:
+    #             args[current_arg_key] = raw_value.strip('"')
+    #         current_arg_key = None
+    #         # We found a complete tool call if we have a name and args
+    #         if tool_name and args:
+    #             # Calculate where this ended
+    #             # This is approximate since we splitlines
+    #             # We'll just return the rest of the text from the current line
+    #             # But we need to know the index.
+    #             pass
+    #     elif current_arg_key is not None:
+    #         value_lines.append(line.strip())
         
-        last_line_end += len(line)
+    #     last_line_end += len(line)
 
-    if tool_name and not current_arg_key and args:
-        # For Strategy 2, we'll just return the remaining text as empty for now 
-        # or try to calculate it.
-        return _build_openai_tool_call(tool_name, args), raw_text[last_line_end:]
+    # if tool_name and not current_arg_key and args:
+    #     # For Strategy 2, we'll just return the remaining text as empty for now 
+    #     # or try to calculate it.
+    #     return _build_openai_tool_call(tool_name, args), raw_text[last_line_end:]
 
-    # --- Strategy 4: JSON Array of Tool Calls ---
-    # This matches: json [ { "tool": "...", "parameters": { ... } } ]
-    if raw_text.strip().startswith("json [") or raw_text.strip().startswith("["):
-        try:
-            # Remove "json " prefix if present
-            json_str = raw_text.strip()
-            if json_str.startswith("json "):
-                json_str = json_str[5:].strip()
+    # # --- Strategy 4: JSON Array of Tool Calls ---
+    # # This matches: json [ { "tool": "...", "parameters": { ... } } ]
+    # if raw_text.strip().startswith("json [") or raw_text.strip().startswith("["):
+    #     try:
+    #         # Remove "json " prefix if present
+    #         json_str = raw_text.strip()
+    #         if json_str.startswith("json "):
+    #             json_str = json_str[5:].strip()
             
-            data = json.loads(json_str)
-            if isinstance(data, list) and len(data) > 0:
-                first_tool = data[0]
-                tool_name = first_tool.get("tool") or first_tool.get("name")
-                args = first_tool.get("parameters") or first_tool.get("arguments") or {}
-                if tool_name:
-                    # For simplicity, we return the first tool call and the rest of the text
-                    # In a real scenario, we might want to handle multiple tool calls
-                    return _build_openai_tool_call(tool_name, args), ""
-        except json.JSONDecodeError:
-            pass
+    #         data = json.loads(json_str)
+    #         if isinstance(data, list) and len(data) > 0:
+    #             first_tool = data[0]
+    #             tool_name = first_tool.get("tool") or first_tool.get("name")
+    #             args = first_tool.get("parameters") or first_tool.get("arguments") or {}
+    #             if tool_name:
+    #                 # For simplicity, we return the first tool call and the rest of the text
+    #                 # In a real scenario, we might want to handle multiple tool calls
+    #                 return _build_openai_tool_call(tool_name, args), ""
+    #     except json.JSONDecodeError:
+    #         pass
 
-    # --- Strategy 3: tool_name{json_args} ---
-    # This matches: tool_name{...} or tool\ntool_name{...}
-    match = re.match(r'^(?:\s*tool\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{)', raw_text, re.IGNORECASE)
-    if match:
-        tool_name = match.group(1)
-        brace_start = match.start(2)
-        count = 0
-        for i in range(brace_start, len(raw_text)):
-            if raw_text[i] == '{':
-                count += 1
-            elif raw_text[i] == '}':
-                count -= 1
-                if count == 0:
-                    json_str = raw_text[brace_start : i+1]
-                    try:
-                        # Try standard JSON first
-                        args = json.loads(json_str)
-                        return _build_openai_tool_call(tool_name, args), raw_text[i+1:]
-                    except json.JSONDecodeError:
-                        # Fallback: Try to parse pseudo-JSON (unquoted keys)
-                        try:
-                            # Very basic pseudo-JSON parser: split by comma, then by colon
-                            # This is fragile but handles simple cases like {key:value, key2:value2}
-                            inner = json_str[1:-1].strip()
-                            parsed_args = {}
-                            # This regex finds key:value pairs where value can be a string, bool, or number
-                            kv_pairs = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|true|false|null|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?|[^{},]+)', inner)
-                            for k, v in kv_pairs:
-                                # Clean up value
-                                v = v.strip()
-                                if v.startswith('"') and v.endswith('"'): v = v[1:-1]
-                                elif v.startswith("'") and v.endswith("'"): v = v[1:-1]
-                                elif v == 'true': v = True
-                                elif v == 'false': v = False
-                                elif v == 'null': v = None
-                                parsed_args[k] = v
+    # # --- Strategy 3: tool_name{json_args} ---
+    # # This matches: tool_name{...} or tool\ntool_name{...}
+    # match = re.match(r'^(?:\s*tool\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{)', raw_text, re.IGNORECASE)
+    # if match:
+    #     tool_name = match.group(1)
+    #     brace_start = match.start(2)
+    #     count = 0
+    #     for i in range(brace_start, len(raw_text)):
+    #         if raw_text[i] == '{':
+    #             count += 1
+    #         elif raw_text[i] == '}':
+    #             count -= 1
+    #             if count == 0:
+    #                 json_str = raw_text[brace_start : i+1]
+    #                 try:
+    #                     # Try standard JSON first
+    #                     args = json.loads(json_str)
+    #                     return _build_openai_tool_call(tool_name, args), raw_text[i+1:]
+    #                 except json.JSONDecodeError:
+    #                     # Fallback: Try to parse pseudo-JSON (unquoted keys)
+    #                     try:
+    #                         # Very basic pseudo-JSON parser: split by comma, then by colon
+    #                         # This is fragile but handles simple cases like {key:value, key2:value2}
+    #                         inner = json_str[1:-1].strip()
+    #                         parsed_args = {}
+    #                         # This regex finds key:value pairs where value can be a string, bool, or number
+    #                         kv_pairs = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|true|false|null|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?|[^{},]+)', inner)
+    #                         for k, v in kv_pairs:
+    #                             # Clean up value
+    #                             v = v.strip()
+    #                             if v.startswith('"') and v.endswith('"'): v = v[1:-1]
+    #                             elif v.startswith("'") and v.endswith("'"): v = v[1:-1]
+    #                             elif v == 'true': v = True
+    #                             elif v == 'false': v = False
+    #                             elif v == 'null': v = None
+    #                             parsed_args[k] = v
                             
-                            if parsed_args:
-                                return _build_openai_tool_call(tool_name, parsed_args), raw_text[i+1:]
-                        except Exception:
-                            pass
-                    break
+    #                         if parsed_args:
+    #                             return _build_openai_tool_call(tool_name, parsed_args), raw_text[i+1:]
+    #                     except Exception:
+    #                         pass
+    #                 break
     
     print(f"DEBUG: text_tool_translate failed")
     return None, raw_text
