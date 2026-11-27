@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import json
 from typing import Any
 from collections import OrderedDict
 
@@ -16,16 +17,19 @@ def message_content_to_text(content: Any) -> str:
         return content
     return str(content)
 
-def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) -> tuple[bool, str | None]:
+def detect_repetition_details(messages: list[dict[str, Any]], threshold: float = 0.7) -> tuple[bool, str | None]:
     """
     Circuit Breaker: Detects if the assistant is repeating itself.
     Checks for both turn-level repetition and internal message looping.
     Returns (is_repeating, reason).
     """
-    assistant_msgs = [m["content"] for m in messages if m["role"] == "assistant"]
+    assistant_msgs = [
+        str(m.get("content", ""))
+        for m in messages
+        if m.get("role") == "assistant" and m.get("content")
+    ]
     if not assistant_msgs:
         return False, None
-    
     last_msg = assistant_msgs[-1].lower()
 
     # 1. Internal Repetition Detection (Intra-message loop)
@@ -66,9 +70,14 @@ def detect_repetition(messages: list[dict[str, str]], threshold: float = 0.7) ->
     
     return False, None
 
+
+def detect_repetition(messages: list[dict[str, Any]], threshold: float = 0.7) -> bool:
+    return detect_repetition_details(messages, threshold)[0]
+
+
 @dataclass
 class ContextBuildResult:
-    messages: list[dict[str, str]]
+    messages: list[dict[str, Any]]
     estimated_tokens: int
     discarded: list[str] = field(default_factory=list)
     token_breakdown: dict[str, int] = field(default_factory=dict)
@@ -103,8 +112,11 @@ class ContextBuilder:
         raw = len(text) / max(self.config.token_char_ratio, 3.0)
         return int(raw * self.config.token_safety_multiplier) + 1
 
-    def _message_tokens(self, message: dict[str, str]) -> int:
-        return self.estimate_tokens(message.get("role", "")) + self.estimate_tokens(message.get("content", ""))
+    def _message_tokens(self, message: dict[str, Any]) -> int:
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        return self.estimate_tokens(message.get("role", "")) + self.estimate_tokens(content)
 
     def compress_context(self, content: str) -> str:
         # Implement your compression logic here
@@ -128,44 +140,59 @@ class ContextBuilder:
         used = 0
         result = []
 
-        # Transparently pass through all incoming messages (System, User, Assistant)
+        incoming_messages_dicts: list[dict[str, Any]] = []
         for msg in incoming_messages:
-            content = message_content_to_text(msg.content)
-            msg_dict = {"role": msg.role, "content": content}
-            cost = self._message_tokens(msg_dict)
-            result.append(msg_dict)
-            used += cost
-            breakdown[msg.role] = breakdown.get(msg.role, 0) + cost
+            msg_dict = msg.model_dump(exclude_none=True)
+            incoming_messages_dicts.append(msg_dict)
+        incoming_cost = sum(self._message_tokens(message) for message in incoming_messages_dicts)
 
-        # 5. Explicit Files (Commented out for transparency/future RAG)
-        # file_context_parts: list[str] = []
-        # for rel in context_files:
-        #     try:
-        #         text, truncated = self.workspace.read_text(rel)
-        #         marker = " truncated" if truncated else ""
-        #         file_context_parts.append(f"--- FILE: {rel}{marker} ---\n{text}")
-        #     except WorkspaceError as exc:
-        #         discarded.append(f"file:{rel}:{exc}")
-        # 
-        # if file_context_parts:
-        #     file_msg = {"role": "system", "content": "\n\n".join(file_context_parts)}
-        #     cost = self._message_tokens(file_msg)
-        #     if used + cost <= budget:
-        #         result.append(file_msg)
-        #         used += cost
-        #         breakdown["explicit_files"] = cost
-        #     else:
-        #         discarded.append("explicit_files")
+        recent_history: list[dict[str, Any]] = []
+        dropped_history = 0
+        remaining = max(budget - incoming_cost, 0)
+        for stored_message in reversed(stored_messages):
+            history_message = {
+                "role": stored_message.role,
+                "content": stored_message.content,
+            }
+            cost = self._message_tokens(history_message)
+            if cost <= remaining:
+                recent_history.append(history_message)
+                remaining -= cost
+                breakdown["recent_history"] = breakdown.get("recent_history", 0) + cost
+            else:
+                dropped_history += 1
+        if dropped_history:
+            discarded.append("recent_history")
+        result.extend(reversed(recent_history))
 
-        # SHould manage budget but comment out for a while 
-        # Debug check  
-        if used > budget:
-            print(f"Message {used} is beyond budget {budget}")
-            # discarded.append("budget_exceeded")
+        file_context_parts: list[str] = []
+        for rel in context_files:
+            try:
+                text, truncated = self.workspace.read_text(rel)
+                marker = " (truncated)" if truncated else ""
+                file_context_parts.append(f"--- FILE: {rel}{marker} ---\n{text}")
+            except WorkspaceError as exc:
+                discarded.append(f"file:{rel}:{exc}")
+        if file_context_parts:
+            file_message = {"role": "system", "content": "\n\n".join(file_context_parts)}
+            file_cost = self._message_tokens(file_message)
+            if file_cost <= remaining:
+                result.append(file_message)
+                remaining -= file_cost
+                breakdown["explicit_files"] = file_cost
+            else:
+                discarded.append("explicit_files")
+
+        # Incoming messages carry the active protocol state and are never evicted.
+        result.extend(incoming_messages_dicts)
+        for role_message in incoming_messages_dicts:
+            role = str(role_message.get("role", ""))
+            cost = self._message_tokens(role_message)
+            breakdown[role] = breakdown.get(role, 0) + cost
 
         # Final token recalculation
         final_used = sum(self._message_tokens(msg) for msg in result)
-        # print(f"INFO: Incoming message TOKENS {final_used} token")
+        used = final_used
 
         return ContextBuildResult(
             messages=result,

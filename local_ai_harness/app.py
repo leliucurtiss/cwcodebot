@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Response, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import AppConfig, load_config
 from .context import ContextPacker, message_content_to_text
-from .gateway import MaasGateway
+from .gateway import MaasGateway, MaasUpstreamError
 from .memory import MemoryManager
 from .logger import setup_logging
 from .models import (
@@ -37,6 +37,7 @@ from .tools_helpers import (
     _content_sse,
     _tool_calls_sse,
     _translate_tool_call,
+    OpenAISSEDecoder,
 )
 from .anthropic import anthropic_router
 from .app_utils import prepare_chat_context
@@ -61,6 +62,27 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     app.state.memory_manager = memory_manager
     app.state.gateway = maas
     app.state.logger = logger
+    @app.exception_handler(MaasUpstreamError)
+    async def maas_upstream_error_handler(request: Request, exc: MaasUpstreamError) -> JSONResponse:
+        logger.error(
+            "MaaS upstream error %s for %s %s: %s",
+            exc.status_code,
+            request.method,
+            request.url.path,
+            exc.detail,
+        )
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": f"MaaS upstream returned HTTP {exc.status_code}: {exc.detail}",
+                },
+            },
+            headers={"x-harness-upstream-status": str(exc.status_code)},
+        )
+
     # Specific routes are defined below.
 
 
@@ -70,6 +92,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             "status": "ok",
             "workspace_root": str(cfg.workspace.root),
             "model": cfg.maas.default_model,
+            "maas_api_key_configured": bool(cfg.maas.api_key),
             "safe_input_budget": cfg.context.safe_input_budget,
         }
 
@@ -187,204 +210,109 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             # print("="*80 + "\n")
             # --- DIAGNOSTIC LOGGING END ---
             async def stream() -> Any:
-                thought_header_printed = False
-                buffer = b""
                 pending_content = ""
-                text_tool_call = False
                 pending_reasoning = ""
-                text_tool_call_reasoning = False
+                saw_native_tool = False
+                translated_tool = False
+                decoder = OpenAISSEDecoder()
 
-                # Markers for tool detection
-                tool_markers = ["TOOL_NAME:", "```tool", "tool_code"]
-                # Regex for tool_name{...} format
-                # tool_name_brace_pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*\s*\{'
+                def maybe_tool_text(value: str) -> bool:
+                    value = value.lstrip()
+                    if not value:
+                        return True
+                    lower = value.lower()
+                    return (
+                        any(marker.startswith(lower) or lower.startswith(marker) for marker in
+                            ("tool_name:", "```tool", "```json", "<tool_call", "<tool_code",
+                             "<function_name", "action:", "tool"))
+                        or lower.startswith("{")
+                        or lower.startswith("[")
+                        or re.fullmatch(r"[A-Za-z_][\w.-]*(?:\s+)?(?:\{[^}]*)?", value) is not None
+                    )
+
+                async def flush_pending() -> Any:
+                    nonlocal pending_content, pending_reasoning, translated_tool
+                    for reasoning in (True, False):
+                        pending = pending_reasoning if reasoning else pending_content
+                        if not pending:
+                            continue
+                        while pending:
+                            translated, remaining = _translate_tool_call(pending)
+                            if translated is None:
+                                if maybe_tool_text(pending):
+                                    logger.warning("Potential fragmented tool call detected: %s", pending[:200])
+                                    print(f"WARNING: Potential fragmented tool call detected: {pending[:200]}")
+                                yield _reason_sse(pending) if reasoning else _content_sse(pending)
+                                break
+                            if pending.lstrip().lower().startswith("tool"):
+                                logger.warning("Potential fragmented tool call translated: %s", pending[:200])
+                                print(f"WARNING: Potential fragmented tool call detected: {pending[:200]}")
+                            translated_tool = True
+                            yield f"data: {translated}\n\n".encode()
+                            pending = remaining
+                    pending_reasoning = ""
+                    pending_content = ""
 
                 async for chunk in maas.stream_chat_completion(payload):
-                    buffer += chunk
-                    while b"\n" in buffer:
-                        raw_line, buffer = buffer.split(b"\n", 1)
-                        line = raw_line.decode("utf-8").strip()
-
-                        if not line or not line.startswith("data: "):
-                            continue
-
-                        if line == "data: [DONE]":
-                            # Final Flush: Handle remaining buffer
-                            # 1. Handle text_tool_call in reasoning
-                            if text_tool_call_reasoning:
-                                # FIX: Unpack the tuple (translated, remaining)
-                                translated_r, remaining_r = _translate_tool_call(pending_reasoning)
-                                if translated_r:
-                                    yield f"data: {translated_r}\n\n".encode("utf-8")
-                                    if remaining_r:
-                                        yield _reason_sse(remaining_r)
-                                elif pending_reasoning:
-                                    yield _reason_sse(pending_reasoning)
-                            elif pending_reasoning:
-                                yield _reason_sse(pending_reasoning)
-                            pending_reasoning = ""
-                            text_tool_call_reasoning = False
-
-                            # 2. Handle text_tool_call in Contents
-                            translated, remaining_c = _translate_tool_call(pending_content)
-                            if translated:
-                                yield f"data: {translated}\n\n".encode("utf-8")
-                                if remaining_c:
-                                    yield _content_sse(remaining_c)
-                                elif pending_content:
-                                    yield _content_sse(pending_content)
-                            elif pending_content:
-                                yield _content_sse(pending_content)
-                            pending_content = ""
-                            text_tool_call = False
+                    for event in decoder.feed(chunk):
+                        if event == "[DONE]":
+                            async for output in flush_pending():
+                                yield output
+                            finish_reason = "tool_calls" if saw_native_tool or translated_tool else "stop"
+                            yield f"data: {json.dumps({'choices': [{'finish_reason': finish_reason}]})}\n\n".encode()
+                            yield b"data: [DONE]\n\n"
+                            return
                         try:
-                            chunk_json = json.loads(line[6:].strip())
+                            chunk_json = json.loads(event)
                         except json.JSONDecodeError:
                             continue
 
-                        choices = chunk_json.get("choices", [])
-                        for choice in choices:
+                        for choice in chunk_json.get("choices", []):
                             delta = choice.get("delta", {})
-
-                            # 1. Handle Reasoning (Thinking)
                             reasoning = delta.get("reasoning_content")
-                            if reasoning:
+                            if isinstance(reasoning, str) and reasoning:
                                 pending_reasoning += reasoning
-                                
-                                # --- REPETITION DETECTION START ---
-                                if len(pending_reasoning) > 100:
-                                    from .context import detect_repetition
-                                    is_repeated, reason = detect_repetition([{"role": "assistant", "content": pending_reasoning}])
-                                    if is_repeated:
-                                        logger.critical(f"Repetition detected in reasoning! Breaking stream.")
-                                        # We can't easily "reset" the MAAS call from here, but we can stop the stream
-                                        # and send a final warning to the user/client.
-                                        yield f"data: {json.dumps({'choices': [{'delta': {'content': '\\n\\n[Circuit Breaker: Repetition detected. Stopping generation.]'}}]})}\n\n".encode("utf-8")
-                                        return 
-                                # --- REPETITION DETECTION END ---
-
-                                if not text_tool_call_reasoning:
-                                    stripped_r = pending_reasoning.lstrip()
-                                    if any(stripped_r.startswith(m) for m in tool_markers):
-                                        text_tool_call_reasoning = True
-                                    elif not (stripped_r.startswith('T') or stripped_r.startswith('`') or stripped_r.startswith('<')):
-                                        yield _reason_sse(pending_reasoning)
-                                        pending_reasoning = ""
-                                    elif len(pending_reasoning) > max(len(m) for m in tool_markers) + 10:
-                                        yield _reason_sse(pending_reasoning)
-                                        pending_reasoning = ""
-                                
-                                if not thought_header_printed:
-                                    # logger.info(f"--- Thinking --- len {len(reasoning)} of {reasoning[0:50]} ")
-                                    thought_header_printed = True
-
-                            # 2. Handle Native Tool Calls (Pass-through)
                             tool_calls = delta.get("tool_calls")
                             if tool_calls:
+                                saw_native_tool = True
                                 yield _tool_calls_sse(tool_calls)
-
-                            # 3. Handle Content (and Text-to-Tool Translation)
                             content = delta.get("content")
                             if isinstance(content, str) and content:
                                 pending_content += content
+                                while True:
+                                    translated, remaining = _translate_tool_call(pending_content)
+                                    if translated is None:
+                                        if not maybe_tool_text(pending_content):
+                                            yield _content_sse(pending_content)
+                                            pending_content = ""
+                                        break
+                                    if pending_content.lstrip().lower().startswith("tool"):
+                                        print(
+                                            "WARNING: Potential fragmented tool call detected: "
+                                            f"{pending_content[:200]}"
+                                        )
+                                    translated_tool = True
+                                    yield f"data: {translated}\n\n".encode()
+                                    pending_content = remaining
 
-                                # --- REPETITION DETECTION START ---
-                                if len(pending_content) > 100:
-                                    from .context import detect_repetition
-                                    is_repeated, reason =  detect_repetition([{"role": "assistant", "content": pending_content}])
-                                    if is_repeated:
-                                        logger.critical(f"[Circuit Breaker] Repetition detected in content! Breaking stream.")
-                                        yield f"data: {json.dumps({'choices': [{'delta': {'content': '\\n\\n[Circuit Breaker: Repetition detected. Stopping generation.]'}}]})}\n\n".encode("utf-8")
-                                        return
-                                # --- REPETITION DETECTION END ---
-
-                                if not text_tool_call:
-                                    # 1. Create a stripped version for detection only
-                                    stripped = pending_content.lstrip()
-
-                                    # 2. Check if the stripped content starts with any of our markers
-                                    if any(stripped.startswith(m) for m in tool_markers):
-                                        text_tool_call = True
-                                    # 3. Buffer if it starts with any character that COULD be a marker (T, `, or <)
-                                    elif not (stripped.startswith('T') or stripped.startswith('`') or stripped.startswith('<')):
-                                        # Definitely not a marker, flush immediately
-                                        yield _content_sse(pending_content)
-                                        pending_content = ""
-                                    elif len(pending_content) > max(len(m) for m in tool_markers) + 10:
-                                        # Buffered enough to know it's not a marker (added padding for whitespace)
-                                        yield _content_sse(pending_content)
-                                        pending_content = ""
-                                else:
-                                    # We are in text_tool_call translating, just accumulate
-                                    print(content, end="", flush=True)
-                                    pass
-
-                            # 3. Handle Finish Reason
-                            if choice.get("finish_reason") is not None:
-                                if text_tool_call: 
-                                    logger.debug(f"We are finishing with tool call {text_tool_call}")
-
-                                # 3.1 Handle text_tool_call in reasoning
-                                if text_tool_call_reasoning:
-                                    translated_r, remaining_r = _translate_tool_call(pending_reasoning)
-                                    if translated_r:
-                                        yield f"data: {translated_r}\n\n".encode("utf-8")
-                                        if remaining_r:
-                                            yield _reason_sse(remaining_r)
-                                    elif pending_reasoning:
-                                        yield _reason_sse(pending_reasoning)
-                                elif pending_reasoning:
-                                    yield _reason_sse(pending_reasoning)
-                                pending_reasoning = ""
-                                text_tool_call_reasoning = False                                
-                                # 3.2 Handle text_tool_call in content
-                                if text_tool_call:
-                                    translated, remaining_c = _translate_tool_call(pending_content)
-                                    if translated:
-                                        yield f"data: {translated}\n\n".encode("utf-8")
-                                        if remaining_c:
-                                            yield _content_sse(remaining_c)
-                                    elif pending_content:
-                                        yield _content_sse(pending_content)
-                                elif pending_content:
-                                    yield _content_sse(pending_content)
-
-                                yield f"data: {json.dumps({'choices': [{'finish_reason': choice.get('finish_reason')}]})}\n\n".encode("utf-8")
-                                pending_content = ""
-                                text_tool_call = False
-
-                # Final Cleanup for any trailing buffer
-                if pending_reasoning:
-                    if text_tool_call_reasoning:
-                        translated_r, remaining_r = _translate_tool_call(pending_reasoning)
-                        if translated_r:
-                            yield f"data: {translated_r}\n\n".encode("utf-8")
-                            if remaining_r:
-                                yield _reason_sse(remaining_r)
-                        else:
-                            yield _reason_sse(pending_reasoning)
-                    else:
-                        yield _reason_sse(pending_reasoning)
-
-                if pending_content:
-                    if text_tool_call:
-                        translated, remaining_c = _translate_tool_call(pending_content)
-                        if translated:
-                            yield f"data: {translated}\n\n".encode("utf-8")
-                            if remaining_c:
-                                yield _content_sse(remaining_c)
-                        else:
-                            yield _content_sse(pending_content)
-                    else:
-                        yield _content_sse(pending_content)
-                return
+                async for output in flush_pending():
+                    yield output
+                yield f"data: {json.dumps({'choices': [{'finish_reason': 'tool_calls' if saw_native_tool or translated_tool else 'stop'}]})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
             
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         response = await maas.chat_completion(payload)
         logger.debug(f"Raw MAAS response: {json.dumps(response)}")
-        # print(f"Response: {response}")  # Print the non-streaming response
+        assistant_message = response.get("choices", [{}])[0].get("message", {})
         assistant_text = _extract_assistant_text(response)
+        if assistant_text and not assistant_message.get("tool_calls"):
+            translated, remaining = _translate_tool_call(assistant_text)
+            if translated:
+                tool_event = json.loads(translated)
+                assistant_message["tool_calls"] = tool_event["choices"][0]["delta"]["tool_calls"]
+                assistant_message["content"] = remaining or None
+                assistant_message.pop("function_call", None)
         if assistant_text:
             storage.add_message(session.conversation.id, "assistant", assistant_text)
         return response

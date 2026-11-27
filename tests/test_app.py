@@ -80,6 +80,23 @@ class StreamingGateway(FakeGateway):
             yield stream[offset:offset + 19].encode("utf-8")
 
 
+class ToolCaptureGateway(FakeGateway):
+    def __init__(self, response_text="") -> None:
+        self.payload: dict[str, Any] | None = None
+        self.response_text = response_text
+
+    async def chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.payload = payload
+        return {
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": self.response_text},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+
 def make_config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         server=ServerConfig(),
@@ -131,6 +148,71 @@ def test_text_tool_call_is_translated_in_stream_and_reasoning_is_preserved(tmp_p
 
 def test_translate_tool_call_rejects_incomplete_arguments() -> None:
     assert _translate_tool_call("TOOL_NAME: read_file\nBEGIN_ARG: filePath\n/path")[0] is None
+
+
+def test_openai_tool_history_and_definitions_are_forwarded(tmp_path: Path) -> None:
+    gateway = ToolCaptureGateway()
+    app = create_app(config=make_config(tmp_path), gateway=gateway)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "devstral",
+                "stream": False,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert gateway.payload is not None
+    assert gateway.payload["tools"][0]["function"]["name"] == "read_file"
+    assert gateway.payload["messages"][0]["tool_calls"][0]["id"] == "call_1"
+    assert gateway.payload["messages"][1]["tool_call_id"] == "call_1"
+
+
+def test_non_stream_text_tool_call_is_translated(tmp_path: Path) -> None:
+    gateway = ToolCaptureGateway(
+        '<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>'
+    )
+    app = create_app(config=make_config(tmp_path), gateway=gateway)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "devstral",
+                "stream": False,
+                "messages": [{"role": "user", "content": "read README"}],
+            },
+        )
+
+    message = response.json()["choices"][0]["message"]
+    assert message["content"] is None
+    assert message["tool_calls"][0]["function"]["name"] == "read_file"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {
+        "path": "README.md"
+    }
 
 
 def test_debug_context_route(tmp_path: Path) -> None:

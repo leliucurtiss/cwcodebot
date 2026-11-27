@@ -1,6 +1,7 @@
 # Local Code Assistant Harness MVP
 
 Minimal local-first OpenAI-compatible harness for VS Code Continue.
+It also exposes an Anthropic Messages API facade for Claude Code.
 
 Continue talks to this local server:
 
@@ -54,6 +55,7 @@ Use any placeholder API key for Continue, for example `local`, because the harne
 GET  /health
 GET  /v1/models
 POST /v1/chat/completions
+POST /v1/messages
 POST /harness/projects
 GET  /harness/projects/{project_id}
 PUT  /harness/projects/{project_id}/memory
@@ -125,3 +127,17 @@ The first tests focus on:
 - context overflow prevention
 - workspace path isolation
 - OpenAI-compatible route behavior with a mocked MaaS gateway
+- Anthropic/OpenAI tool-definition, tool-call, and tool-result translation
+- fragmented SSE tool calls and text-emitted tool-call formats
+
+## Claude Code
+
+Point Claude Code's Anthropic base URL at the local harness, using the same host
+and port documented above. Claude Code tool definitions and `tool_result`
+messages are translated to OpenAI `tools` and `tool` messages before the
+request reaches MaaS. Native OpenAI `tool_calls` and common text-emitted tool
+formats are translated back into Anthropic `tool_use` blocks.
+
+The stream translator handles upstream SSE records split across arbitrary
+network chunks and assembles fragmented function arguments before emitting
+Anthropic `input_json_delta` events.

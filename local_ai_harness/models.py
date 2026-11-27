@@ -2,15 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"] | str
     content: str | list[Any] | None = ""
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ChatCompletionRequest(BaseModel):
@@ -21,8 +20,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: int | None = None
     context_files: list[str] = Field(default_factory=list)
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class MessagesRequest(BaseModel):
@@ -36,8 +34,7 @@ class MessagesRequest(BaseModel):
     top_k: int | None = None
     stop_sequences: list[str] | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class CompletionRequest(BaseModel):
@@ -48,8 +45,7 @@ class CompletionRequest(BaseModel):
     max_tokens: int | None = None
     stop: str | list[str] | None = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 class ProjectCreateRequest(BaseModel):

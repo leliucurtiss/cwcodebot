@@ -86,6 +86,9 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     base_url = str(maas.get("base_url", "")).rstrip("/")
     if not base_url:
         raise ValueError("maas.base_url is required")
+    api_key = str(maas.get("api_key", "")).strip()
+    if api_key.lower().startswith("bearer "):
+        api_key = api_key[7:].strip()
 
     return AppConfig(
         server=ServerConfig(
@@ -94,7 +97,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         ),
         maas=MaasConfig(
             base_url=base_url,
-            api_key=str(maas.get("api_key", "")),
+            api_key=api_key,
             default_model=str(maas.get("default_model", "devstral")),
             timeout_seconds=float(maas.get("timeout_seconds", 300)),
         ),

@@ -1,6 +1,6 @@
 from typing import Any, Tuple, List, Optional
 from .models import ChatMessage
-from .context import message_content_to_text, detect_repetition
+from .context import message_content_to_text, detect_repetition_details
 
 async def prepare_chat_context(
     session_manager: Any,
@@ -34,7 +34,7 @@ async def prepare_chat_context(
         raise
 
     # Circuit Breaker: Detect repetition in the built context
-    is_repeated, reason = detect_repetition(built.messages)
+    is_repeated, reason = detect_repetition_details(built.messages)
     if is_repeated:
         logger.debug(f"[Circuit Breaker] Repetition detected! Reason: {reason}. Injecting warning.")
         built.messages.append({

@@ -1,282 +1,511 @@
+from __future__ import annotations
+
+import ast
 import json
 import re
 import uuid
-from typing import Any
+from typing import Any, Iterable
+
 
 def _extract_assistant_text(response: dict[str, Any]) -> str:
-    try:
-        message = response.get("choices", [{}])[0].get("message", {})
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return content
-        return json.dumps(content, ensure_ascii=False)
-    except Exception:
+    message = response.get("choices", [{}])[0].get("message", {})
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content
+    if content is None:
         return ""
+    return json.dumps(content, ensure_ascii=False)
+
 
 def _reason_sse(content: str) -> bytes:
     event = {"choices": [{"delta": {"reasoning_content": content}}]}
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+
 
 def _content_sse(content: str) -> bytes:
     event = {"choices": [{"delta": {"content": content}}]}
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+
 
 def _tool_calls_sse(tool_calls: Any) -> bytes:
     event = {"choices": [{"delta": {"tool_calls": tool_calls}}]}
-    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
 
-def _build_openai_tool_call(name: str, args: Any) -> str:
-    """Helper to format a tool call as an OpenAI SSE delta."""
-    return json.dumps({
-        "choices": [{
-            "delta": {
-                "tool_calls": [{
-                    "index": 0,
-                    "id": f"call_{re.sub(r'[^a-z0-9]', '', name)[:12]}", 
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": json.dumps(args) if isinstance(args, (dict, list)) else args
+
+def _build_openai_tool_call(name: str, args: Any, tool_id: str | None = None) -> str:
+    if isinstance(args, str):
+        try:
+            parsed_args = json.loads(args)
+        except json.JSONDecodeError:
+            parsed_args = {"input": args}
+        arguments = json.dumps(parsed_args, ensure_ascii=False)
+    else:
+        arguments = json.dumps(args, ensure_ascii=False)
+    return json.dumps(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": tool_id or f"call_{uuid.uuid4().hex[:24]}",
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }
+                        ]
                     }
-                }]
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+
+
+def _build_openai_tool_calls(tools: list[tuple[str, Any]]) -> str:
+    tool_calls = []
+    for index, (name, args) in enumerate(tools):
+        if isinstance(args, str):
+            arguments = json.dumps({"input": args}, ensure_ascii=False)
+        else:
+            arguments = json.dumps(args, ensure_ascii=False)
+        tool_calls.append(
+            {
+                "index": index,
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
             }
-        }]
-    }, ensure_ascii=False)
+        )
+    return json.dumps({"choices": [{"delta": {"tool_calls": tool_calls}}]}, ensure_ascii=False)
+
+
+def _split_top_level(value: str, separator: str = ",") -> list[str]:
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for index, char in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char in "[{(":
+            depth += 1
+        elif char in "]})":
+            depth -= 1
+        elif char == separator and depth == 0:
+            parts.append(value[start:index].strip())
+            start = index + 1
+    parts.append(value[start:].strip())
+    return [part for part in parts if part]
+
+
+def _parse_fuzzy_value(raw: str) -> Any:
+    value = raw.strip()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        pass
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered in {"null", "none"}:
+        return None
+    try:
+        return ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return value.strip("\"'")
+
+
+def _parse_json_fuzzy(json_str: str) -> Any:
+    value = json_str.strip()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        pass
+
+    if value.startswith("{") and value.endswith("}"):
+        result: dict[str, Any] = {}
+        for pair in _split_top_level(value[1:-1]):
+            key, separator, raw_value = pair.partition(":")
+            if not separator:
+                return None
+            key = key.strip().strip("\"'")
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", key):
+                return None
+            result[key] = _parse_json_fuzzy(raw_value) if raw_value[:1] in "[{" else _parse_fuzzy_value(raw_value)
+        return result
+    if value.startswith("[") and value.endswith("]"):
+        parsed = [_parse_json_fuzzy(part) for part in _split_top_level(value[1:-1])]
+        if any(item is None for item in parsed):
+            return None
+        return parsed
+    return _parse_fuzzy_value(value)
+
+
+def _find_matching(value: str, start: int, opening: str = "{", closing: str = "}") -> int | None:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start, len(value)):
+        char = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _tool_from_mapping(data: dict[str, Any]) -> tuple[str, Any] | None:
+    if data.get("type") == "tool_use" and data.get("name"):
+        return str(data["name"]), data.get("input", {})
+
+    function = data.get("function")
+    if isinstance(function, dict) and function.get("name"):
+        arguments = _parse_json_fuzzy(function.get("arguments", "{}"))
+        return str(function["name"]), {} if arguments is None else arguments
+    if isinstance(function, str) and function:
+        return function, data.get("arguments", data.get("input", data.get("parameters", {})))
+
+    for name_key in ("name", "command", "tool", "function_name"):
+        name = data.get(name_key)
+        if isinstance(name, str) and name:
+            args = data.get("arguments", data.get("parameters", data.get("input", data.get("args", {}))))
+            if isinstance(args, str):
+                args = _parse_json_fuzzy(args)
+            return name, {} if args is None else args
+
+    if len(data) == 1:
+        name, args = next(iter(data.items()))
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", str(name)):
+            return str(name), args
+    return None
+
+
+def _parse_tool_mapping(raw: str) -> tuple[str, Any, str] | None:
+    parsed = _parse_json_fuzzy(raw)
+    if isinstance(parsed, dict):
+        tool = _tool_from_mapping(parsed)
+        if tool:
+            return tool[0], tool[1], ""
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict):
+                tool = _tool_from_mapping(item)
+                if tool:
+                    return tool[0], tool[1], ""
+    return None
+
+
+def _tool_match(raw_text: str) -> tuple[int, int, str, Any] | None:
+    text = raw_text.lstrip()
+    leading = len(raw_text) - len(text)
+
+    patterns = (
+        r"Action:\s*([A-Za-z_][\w.-]*)\s*\n+\s*Action\s+Input:\s*",
+        r"TOOL_NAME:\s*([A-Za-z_][\w.-]*)\s*\n(?:\s*)BEGIN_ARG:",
+    )
+    action = re.match(patterns[0], text, re.IGNORECASE)
+    if action:
+        payload_start = action.end()
+        name = action.group(1)
+        first_line = text[payload_start:].splitlines()[0].strip()
+        if first_line.startswith(("{", "[")):
+            end = _find_matching(text, payload_start, first_line[0], "}" if first_line[0] == "{" else "]")
+            if end is None:
+                return None
+            args = _parse_json_fuzzy(text[payload_start : end + 1])
+            return leading, payload_start + len(text[payload_start : end + 1]), name, args
+        value_end = text.find("\n\n", payload_start)
+        value_end = len(text) if value_end < 0 else value_end
+        value = text[payload_start:value_end].strip()
+        return leading, payload_start + len(value), name, {"input": _parse_fuzzy_value(value)}
+
+    line_format = re.match(patterns[1], text, re.IGNORECASE)
+    if line_format:
+        name = line_format.group(1)
+        args: dict[str, Any] = {}
+        cursor = line_format.end() - len("BEGIN_ARG:")
+        pattern = re.compile(r"\s*BEGIN_ARG:\s*([A-Za-z_][\w.-]*)\s*\n(.*?)\n\s*END_ARG", re.DOTALL)
+        matches = list(pattern.finditer(text, line_format.end() - len("BEGIN_ARG:")))
+        if not matches:
+            return None
+        for match in matches:
+            args[match.group(1)] = _parse_fuzzy_value(match.group(2).strip())
+            cursor = match.end()
+        return leading, cursor, name, args
+
+    xml = re.match(
+        r"<(?:function_name|tool_name)>\s*([^<]+?)\s*</(?:function_name|tool_name)>\s*"
+        r"<(?:parameters|arguments)>\s*(.*?)\s*</(?:parameters|arguments)>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if xml:
+        args = _parse_json_fuzzy(xml.group(2))
+        if args is not None:
+            return leading, xml.end(), xml.group(1).strip(), args
+
+    tag = re.search(r"<(tool_call|tool_code)>(.*?)</\1>", raw_text, re.DOTALL | re.IGNORECASE)
+    if tag:
+        parsed = _parse_tool_mapping(tag.group(2).strip())
+        if parsed:
+            return tag.start(), tag.end(), parsed[0], parsed[1]
+
+    fence = re.search(r"```(?:tool|json)\s*\n?(.*?)```", raw_text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        parsed = _parse_tool_mapping(fence.group(1).strip())
+        if parsed:
+            return fence.start(), fence.end(), parsed[0], parsed[1]
+
+    brace = re.search(r"(?:(?:tool)\s+)?([A-Za-z_][\w.-]*)\s*(\{)", raw_text, re.IGNORECASE)
+    if brace:
+        start = brace.start(2)
+        end = _find_matching(raw_text, start)
+        if end is not None:
+            args = _parse_json_fuzzy(raw_text[start : end + 1])
+            if args is not None:
+                return brace.start(), end + 1, brace.group(1), args
+
+    stripped = raw_text.strip()
+    if stripped.startswith(("{", "[")):
+        start = len(raw_text) - len(raw_text.lstrip())
+        opening = stripped[0]
+        end = _find_matching(raw_text, start, opening, "}" if opening == "{" else "]")
+        if end is not None:
+            parsed = _parse_tool_mapping(raw_text[start : end + 1])
+            if parsed:
+                return start, end + 1, parsed[0], parsed[1]
+    return None
+
 
 def _translate_tool_call(raw_text: str) -> tuple[str | None, str]:
-    """
-    Translates MaaS text format into OpenAI tool call SSE.
-    Returns (translated_json_or_none, remaining_text).
-    """
-    # --- Strategy 3: tool_name{json_args} ---
-    match = re.match(r'^(?:\s*tool\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{)', raw_text, re.IGNORECASE)
-    if match:
-        tool_name = match.group(1)
-        brace_start = match.start(2)
-        count = 0
-        for i in range(brace_start, len(raw_text)):
-            if raw_text[i] == '{':
-                count += 1
-            elif raw_text[i] == '}':
-                count -= 1
-                if count == 0:
-                    json_str = raw_text[brace_start : i+1]
-                    try:
-                        args = json.loads(json_str)
-                        return _build_openai_tool_call(tool_name, args), raw_text[i+1:]
-                    except json.JSONDecodeError:
-                        try:
-                            inner = json_str[1:-1].strip()
-                            parsed_args = {}
-                            kv_pairs = re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'|true|false|null|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?|[^{},]+)', inner)
-                            for k, v in kv_pairs:
-                                v = v.strip()
-                                if v.startswith('"') and v.endswith('"'): v = v[1:-1]
-                                elif v.startswith("'") and v.endswith("'"): v = v[1:-1]
-                                elif v == 'true': v = True
-                                elif v == 'false': v = False
-                                elif v == 'null': v = None
-                                parsed_args[k] = v
-                            return _build_openai_tool_call(tool_name, parsed_args), raw_text[i+1:]
-                        except Exception:
-                            pass
-    return None, raw_text
+    stripped = raw_text.lstrip()
+    if stripped.startswith("["):
+        start = len(raw_text) - len(stripped)
+        end = _find_matching(raw_text, start, "[", "]")
+        if end is not None:
+            parsed = _parse_json_fuzzy(raw_text[start : end + 1])
+            if isinstance(parsed, list):
+                tools = [
+                    tool
+                    for item in parsed
+                    if isinstance(item, dict)
+                    for tool in [_tool_from_mapping(item)]
+                    if tool is not None
+                ]
+                if tools and len(tools) == len(parsed):
+                    return _build_openai_tool_calls(tools), raw_text[:start] + raw_text[end + 1 :]
+    match = _tool_match(raw_text)
+    if not match:
+        return None, raw_text
+    start, end, name, args = match
+    return _build_openai_tool_call(name, args), raw_text[:start] + raw_text[end:]
+
 
 def translate_anthropic_to_openai_tools(anthropic_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Translates a list of tools from Anthropic format to OpenAI format.
-    """
-    # print(f"TRACE: translate_anthropic_to_openai_tools INPUT: {str(json.dumps(anthropic_tools, indent=2)[:50])}")
     openai_tools = []
     for tool in anthropic_tools:
-        openai_tool = {
-            "type": "function",
-            "function": {
-                "name": tool.get("name"),
-                "description": tool.get("description"),
-                "parameters": tool.get("input_schema", {}),
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        openai_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+                },
             }
-        }
-        openai_tools.append(openai_tool)
-    print(f"TRACE: translate_anthropic_to_openai_tools OUTPUT: {str(json.dumps(openai_tools, indent=2))[:50]}")
+        )
     return openai_tools
 
+
 def translate_openai_tool_to_anthropic(openai_tool: dict[str, Any]) -> dict[str, Any]:
-    """
-    Translates a single OpenAI tool call into an Anthropic tool_use block.
-    """
-    func = openai_tool.get("function", {})
-    args_str = func.get("arguments", "{}")
-    
+    function = openai_tool.get("function", {})
+    arguments = function.get("arguments", "{}")
     try:
-        args = json.loads(args_str) if isinstance(args_str, str) else args_str
+        parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
     except json.JSONDecodeError:
-        args = {"error": "failed to parse arguments", "raw": args_str}
-
-    print(f"TRACE: translate_openai_tool_to_anthropic INPUT: {str(args)[:50]}")
-
+        parsed = {}
     return {
         "type": "tool_use",
-        "id": openai_tool.get("id"),
-        "name": func.get("name"),
-        "input": args
+        "id": openai_tool.get("id") or f"tool_{uuid.uuid4().hex[:24]}",
+        "name": function.get("name") or "unknown_tool",
+        "input": parsed if isinstance(parsed, dict) else {"value": parsed},
     }
 
+
+def _content_parts_to_text(parts: Iterable[Any]) -> str:
+    values = []
+    for part in parts:
+        if isinstance(part, str):
+            values.append(part)
+        elif isinstance(part, dict):
+            if part.get("type") == "text":
+                values.append(str(part.get("text", "")))
+            elif "text" in part:
+                values.append(str(part["text"]))
+    return "".join(values)
+
+
+def translate_anthropic_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    translated: list[dict[str, Any]] = []
+    for message in messages:
+        data = message.model_dump(exclude_none=True) if hasattr(message, "model_dump") else dict(message)
+        role = str(data.get("role", "user"))
+        content = data.get("content", "")
+        if not isinstance(content, list):
+            translated.append({"role": role, "content": content})
+            continue
+
+        text = _content_parts_to_text(content)
+        tool_uses = [part for part in content if isinstance(part, dict) and part.get("type") == "tool_use"]
+        tool_results = [part for part in content if isinstance(part, dict) and part.get("type") == "tool_result"]
+
+        if tool_uses:
+            translated.append(
+                {
+                    "role": "assistant",
+                    "content": text or None,
+                    "tool_calls": [
+                        {
+                            "id": part.get("tool_use_id") or part.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                            "type": "function",
+                            "function": {
+                                "name": part.get("name") or "unknown_tool",
+                                "arguments": json.dumps(part.get("input", {}), ensure_ascii=False),
+                            },
+                        }
+                        for part in tool_uses
+                    ],
+                }
+            )
+        elif tool_results:
+            if text:
+                translated.append({"role": "user", "content": text})
+            for result in tool_results:
+                result_content = result.get("content", "")
+                if isinstance(result_content, list):
+                    result_content = _content_parts_to_text(result_content)
+                elif not isinstance(result_content, str):
+                    result_content = json.dumps(result_content, ensure_ascii=False)
+                translated.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": result.get("tool_use_id") or "",
+                        "content": result_content,
+                    }
+                )
+        else:
+            translated.append({"role": role, "content": text})
+    return translated
+
+
 def translate_text_to_anthropic_tools(raw_text: str) -> tuple[list[dict[str, Any]], str]:
-    """
-    Detects tool calls in text (like <tool_code>{...}</tool_code>, tool_name{...}, or JSON arrays)
-    and translates them to a list of Anthropic tool_use blocks.
-    """
-    tools = []
-    remaining_text = raw_text
-
-    # 1. Check for JSON array format [ {...}, {...} [ {...}, {...} ]
-    # Find the first '[' and then find its matching ' '[' and then find its matching ']'
-    print(f" {raw_text}",end="")
-    start_idx = remaining_text.find('[')
-    if start_idx != -1:
-        count = 0
-        for i in range(start_idx, len(remaining_text)):
-            if remaining_text[i] == '[': count += 1
-            elif remaining_text[i] == ']':
-                count -= 1
-                if count == 0:
-                    json_str = remaining_text[start_idx : i+1]
-                    try:
-                        tool_list = json.loads(json_str)
-                        if isinstance(tool_list, list):
-                            found_any_tool = False
-                            extracted_text = []
-                            for item in tool_list:
-                                if not isinstance(item, dict): continue
-                                if item.get("type") == "tool_use":
-                                    tools.append({
-                                        "type": "tool_use",
-                                        "id": item.get("id", f"tool_{uuid.uuid4().hex[:12]}"),
-                                        "name": item.get("name"),
-                                        "input": item.get("input", {})
-                                    })
-                                    found_any_tool = True
-                                elif item.get("type") == "function" or "function" in item:
-                                    tools.append(translate_openai_tool_to_anthropic(item))
-                                    found_any_tool = True
-                                elif "tool" in item:
-                                    tools.append({
-                                        "type": "tool_use",
-                                        "id": f"tool_{uuid.uuid4().hex[:12]}",
-                                        "name": item["tool"],
-                                        "input": item.get("parameters", {})
-                                    })
-                                    found_any_tool = True
-                                elif item.get("type") == "text":
-                                    extracted_text.append(item.get("text", ""))
-
-                            if found_any_tool:
-                                replacement = " ".join(extracted_text)
-                                remaining_text = remaining_text.replace(json_str, replacement)
-                                return tools, remaining_text
-                    except json.JSONDecodeError:
-                        pass
-
-    # 2. Check for <tool_code> tags (Now supports multi-line)
-    tag_match = re.search(r'<tool_code>(.*?)</tool_code>', remaining_text, re.DOTALL)
-    if tag_match:
-        content = tag_match.group(1).strip()
-        # Use fuzzy parser on the entire block instead of just the first line
-        tool_data = _parse_json_fuzzy(content)
-        if isinstance(tool_data, dict) and len(tool_data) == 1:
-            name, args = list(tool_data.items())[0]
-            tools.append({
+    tools: list[dict[str, Any]] = []
+    remaining = raw_text
+    while True:
+        array_start = remaining.find("[")
+        if array_start >= 0:
+            array_end = _find_matching(remaining, array_start, "[", "]")
+            if array_end is not None:
+                parsed = _parse_json_fuzzy(remaining[array_start : array_end + 1])
+                if isinstance(parsed, list):
+                    mapped = [
+                        tool
+                        for item in parsed
+                        if isinstance(item, dict)
+                        for tool in [_tool_from_mapping(item)]
+                        if tool is not None
+                    ]
+                    if mapped and len(mapped) == len(parsed):
+                        tools.extend(
+                            {
+                                "type": "tool_use",
+                                "id": f"tool_{uuid.uuid4().hex[:24]}",
+                                "name": name,
+                                "input": args if isinstance(args, dict) else {"value": args},
+                            }
+                            for name, args in mapped
+                        )
+                        remaining = remaining[:array_start] + remaining[array_end + 1 :]
+                        continue
+        match = _tool_match(remaining)
+        if not match:
+            break
+        start, end, name, args = match
+        tools.append(
+            {
                 "type": "tool_use",
-                "id": f"tool_{uuid.uuid4().hex[:12]}",
+                "id": f"tool_{uuid.uuid4().hex[:24]}",
                 "name": name,
-                "input": args
-            })
-            remaining_text = remaining_text.replace(tag_match.group(0), "")
-            return tools, remaining_text
+                "input": args if isinstance(args, dict) else {"value": args},
+            }
+        )
+        remaining = remaining[:start] + remaining[end:]
+    return tools, remaining.strip()
 
-    # 3. Fallback to tool_name{...} pattern (Now uses re.search for conversational filler)
-    match = re.search(r'(?:\s*tool\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*(\{)', remaining_text, re.IGNORECASE)
-    if match:
-        tool_name = match.group(1)
-        brace_start = match.start(2)
-        count = 0
-        for i in range(brace_start, len(remaining_text)):
-            if remaining_text[i] == '{': count += 1
-            elif remaining_text[i] == '}':
-                count -= 1
-                if count == 0:
-                    json_str = remaining_text[brace_start : i+1]
-                    args = _parse_json_fuzzy(json_str)
-                    if args is not None:
-                        tools.append({
-                            "type": "tool_use",
-                            "id": f"tool_{uuid.uuid4().hex[:12]}",
-                            "name": tool_name,
-                            "input": args
-                        })
-                        # Remove the tool call and everything before it to clean up the text
-                        remaining_text = remaining_text[i+1:]
-                        return tools, remaining_text
-
-    return tools, remaining_text
 
 def anthropic_start_tool_block(index: int, tool_id: str, name: str) -> bytes:
-    """Generates the content_block_start event for a tool use."""
     payload = {
         "type": "content_block_start",
         "index": index,
-        "content_block": {
-            "type": "tool_use",
-            "id": tool_id,
-            "name": name,
-            "input": {}
-        }
+        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
     }
-    return f"event: content_block_start\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+    return f"event: content_block_start\ndata: {json.dumps(payload)}\n\n".encode()
+
 
 def anthropic_tool_delta(index: int, partial_json: str) -> bytes:
-    """Generates the content_block_delta event for tool input."""
     payload = {
         "type": "content_block_delta",
         "index": index,
-        "delta": {
-            "type": "input_json_delta",
-            "partial_json": partial_json
-        }
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
     }
-    return f"event: content_block_delta\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+    return f"event: content_block_delta\ndata: {json.dumps(payload)}\n\n".encode()
+
 
 def anthropic_stop_block(index: int) -> bytes:
-    """Generates the content_block_stop event."""
-    payload = {
-        "type": "content_block_stop",
-        "index": index
-    }
-    return f"event: content_block_stop\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
+    payload = {"type": "content_block_stop", "index": index}
+    return f"event: content_block_stop\ndata: {json.dumps(payload)}\n\n".encode()
 
-def _parse_json_fuzzy(json_str: str) -> Any:
-    """Attempts to parse JSON strictly, then falls back to a fuzzy regex-based parser."""
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        try:
-            # Remove outer braces if present
-            inner = json_str.strip()
-            if inner.startswith('{') and inner.endswith('}'):
-                inner = inner[1:-1].strip()
 
-            parsed_args = {}
-            # Regex to find key:value pairs, handling strings, booleans, and numbers
-            kv_pairs = re.findall(r'''([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|true|false|null|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?|[^{},]+)''', inner)
-            for k, v in kv_pairs:
-                v = v.strip()
-                if v.startswith('"') and v.endswith('"'): v = v[1:-1]
-                elif v.startswith("'") and v.endswith("'"): v = v[1:-1]
-                elif v == 'true': v = True
-                elif v == 'false': v = False
-                elif v == 'null': v = None
-                parsed_args[k] = v
-            return parsed_args
-        except Exception:
-            return None
+class OpenAISSEDecoder:
+    def __init__(self) -> None:
+        self.buffer = b""
+
+    def feed(self, chunk: bytes) -> list[str]:
+        self.buffer += chunk
+        events: list[str] = []
+        while True:
+            line_end = self.buffer.find(b"\n")
+            if line_end < 0:
+                break
+            raw_line = self.buffer[:line_end]
+            self.buffer = self.buffer[line_end + 1 :]
+            line = raw_line.rstrip(b"\r")
+            if line.startswith(b"data:"):
+                events.append(line[5:].lstrip().decode("utf-8"))
+        return events
