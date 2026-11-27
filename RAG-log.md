@@ -1,6 +1,6 @@
 ### 2026-11-20
 
-DEBUG: Payload keys: ['model', 'messages', 'stream', 'temperature', 
+TRACE: Payload keys: ['model', 'messages', 'stream', 'temperature', 
 'context_files', 'top_p', 'tools', 'n', 'stream_options', 'max_tokens']
 
 ### 2026-11-15

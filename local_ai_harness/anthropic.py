@@ -20,7 +20,12 @@ from .app_utils import prepare_chat_context
 from .tools_helpers import (
     translate_openai_tool_to_anthropic,
     translate_anthropic_to_openai_tools,
+    anthropic_start_tool_block,
+    anthropic_tool_delta,
+    anthropic_stop_block,
+    translate_text_to_anthropic_tools,
 )
+
 anthropic_router = APIRouter()
 
 @anthropic_router.get("/v1/oauth/hello")
@@ -143,8 +148,23 @@ async def messages(
     # 1. Translate Anthropic request to internal format
     logger.debug(f"This is message from Claude {req.messages}")
     internal_messages = list(req.messages)
+    
+    # Augment system prompt to force agentic tool use and prevent "chatty" JSON output
+    agent_steering = (
+        "\n\nIMPORTANT: You are a professional coding agent. When you need to perform an action "
+        "(like listing files, reading code, or running commands), you MUST use the provided tools. "
+        "Do not describe your thought process or output JSON in markdown; use the tool-calling API directly."
+    )
+    
     if req.system:
-        internal_messages.insert(0, ChatMessage(role="system", content=req.system))
+        if isinstance(req.system, str):
+            content = req.system + agent_steering
+        else:
+            system_text = " ".join([b.get("text", str(b)) if isinstance(b, dict) else str(b) for b in req.system])
+            content = system_text + agent_steering
+        internal_messages.insert(0, ChatMessage(role="system", content=content))
+    else:
+        internal_messages.insert(0, ChatMessage(role="system", content=agent_steering))
 
     # 2. Prepare context and save messages
     session, built_messages, _ = await prepare_chat_context(
@@ -169,7 +189,7 @@ async def messages(
         translated_tools = translate_anthropic_to_openai_tools(model_extra['tools'])
         if translated_tools:
             payload["tools"] = translated_tools
-
+            payload["tool_choice"] = "auto"
 
     if req.stream:
         async def anthropic_stream() -> Any:
@@ -177,6 +197,7 @@ async def messages(
             block_index = 0
             current_block_type = "text"
             active_tools = {} # Map OpenAI tool index -> Anthropic block_index
+            text_buffer = "" # Buffer to accumulate potential tool calls
 
             # 1. message_start
             yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'role': 'assistant', 'model': payload['model']}})}\n\n".encode("utf-8")
@@ -190,11 +211,24 @@ async def messages(
                 
                 line = chunk.decode("utf-8").strip()
                 if line == "data: [DONE]":
+                    # Flush any remaining text in the buffer
+                    if text_buffer:
+                        if current_block_type != "text":
+                            block_index += 1
+                            current_block_type = "text"
+                            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
+                        
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n".encode("utf-8")
+                        yield anthropic_stop_block(block_index)
+                        text_buffer = ""
+
                     # Close all remaining blocks
                     for idx in sorted(active_tools.keys()):
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': active_tools[idx]})}\n\n".encode("utf-8")
+                        print(f"\nTrace: SSE: Closing tool block {active_tools[idx]}")
+                        yield anthropic_stop_block(active_tools[idx])
                     if current_block_type == "text":
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
+                        print(f"\nTRACE: text SSE: Closing text block {block_index}")
+                        yield anthropic_stop_block(block_index)
                     
                     yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}})}\n\n".encode("utf-8")
                     yield b"event: message_stop\ndata: {}\n\n"
@@ -212,7 +246,7 @@ async def messages(
                         if current_block_type != "text":
                             # Close all active tools before starting a new text block
                             for idx in sorted(active_tools.keys()):
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': active_tools[idx]})}\n\n".encode("utf-8")
+                                yield anthropic_stop_block(active_tools[idx])
                             active_tools.clear()
                             
                             block_index += 1
@@ -220,34 +254,102 @@ async def messages(
                             yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode("utf-8")
                         
                         text_delta = reasoning or content
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_delta}})}\n\n".encode("utf-8")
+                        # print(f"{text_delta}", end="", flush=True)     
 
-                    # --- Handle Native Tool Calls ---
-                    tool_calls = delta.get("tool_calls")
-                    if tool_calls:
-                        for tc in tool_calls:
-                            idx = tc.get("index")
-                            if idx not in active_tools:
-                                if current_block_type == "text":
-                                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n".encode("utf-8")
-                                    current_block_type = "none"
+                        # --- Buffering Logic for Fragmented Tool Calls ---
+                        if "[" in text_delta or text_buffer:
+                            text_buffer += text_delta
+
+                            # If we see a closing bracket, try to translate the buffer
+                            if "]" in text_buffer:
+                                print(f"\n Trace: buffer finished {text_buffer[:80]}")
+                                tools, cleaned_text = translate_text_to_anthropic_tools(text_buffer)
                                 
-                                block_index += 1
-                                active_tools[idx] = block_index
-                                current_block_type = "tool_use"
+                                if tools:
+                                    # 1. Yield any text that came before the tool array
+                                    if cleaned_text:
+                                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': cleaned_text}})}\n\n".encode("utf-8")
+                                    
+                                    # 2. Transition to tool blocks
+                                    if current_block_type == "text":
+                                        yield anthropic_stop_block(block_index)
+                                        current_block_type = "none"
+
+                                    for tool in tools:
+                                        block_index += 1
+                                        current_block_type = "tool_use"
+                                        yield anthropic_start_tool_block(block_index, tool["id"], tool["name"])
+                                        yield anthropic_tool_delta(block_index, json.dumps(tool["input"]))
+                                        yield anthropic_stop_block(block_index)
+                                    
+                                    text_buffer = "" # Clear buffer after successful translation
+                                    # Note: If there's text after the ']', it's handled in the next chunk
+                                    continue 
+                                else:
+                                    # IMPORTANT: If we saw a ']' but no tools were found, 
+                                    # it's just plain text. Flush the buffer and reset.
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_buffer}})}\n\n".encode("utf-8")
+                                    text_buffer = ""
+                                    continue                                
+                        else:
+                            # Normal text, no buffering needed
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': block_index, 'delta': {'type': 'text_delta', 'text': text_delta}})}\n\n".encode("utf-8")
+                            continue
+
+                        # If we are buffering but haven't seen a ']' yet, we don't yield anything.
+                        # The text will be yielded once the buffer is flushed or translated.                        
+                        # --- Handle Native Tool Calls ---
+                        tool_calls = delta.get("tool_calls")
+                        if tool_calls:
+                            print(f"TRACE: SSE: Detected OpenAI tool calls in delta: {tool_calls}") 
+                            for tc in tool_calls:
+                                idx = tc.get("index")
+                                if idx not in active_tools:
+                                    if current_block_type == "text":
+                                        yield anthropic_stop_block(block_index)
+                                        current_block_type = "none"
+                                    
+                                    block_index += 1
+                                    active_tools[idx] = block_index
+                                    current_block_type = "tool_use"
+                                    
+                                    name = tc.get("function", {}).get("name", "unknown")
+                                    tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
+                                    yield anthropic_start_tool_block(block_index, tc_id, name)
                                 
-                                name = tc.get("function", {}).get("name", "unknown")
-                                tc_id = tc.get("id", f"call_{uuid.uuid4().hex[:12]}")
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': {'type': 'tool_use', 'id': tc_id, 'name': name, 'input': {}}})}\n\n".encode("utf-8")
-                            
-                            args = tc.get("function", {}).get("arguments", "")
-                            if args:
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': active_tools[idx], 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n".encode("utf-8")
-                                
+                                args = tc.get("function", {}).get("arguments", "")
+                                if args:
+                                    yield anthropic_tool_delta(active_tools[idx], args)
+
+                        if text_delta:
+                            # If we have tool_calls in this chunk, suppress text_delta if it's just a redundant tool name
+                            if tool_calls:
+                                is_redundant = False
+                                for tc in tool_calls:
+                                    if text_delta.strip() == tc.get("function", {}).get("name"):
+                                        is_redundant = True
+                                        break
+                                if is_redundant:
+                                    continue
+
+                            # If we were in a tool block, stop it before starting text
+                            if current_block_type == "tool_use":
+                                for idx in list(active_tools.keys()):
+                                    yield anthropic_stop_block(active_tools[idx])
+                                active_tools.clear()
+                                current_block_type = "none"
+
+                            # Check if this text contains tool calls that need translation
+                            tools, cleaned_text = translate_text_to_anthropic_tools(text_delta)
+                                    
                 except Exception as e:
-                    print(f"DEBUG: SSE Translation Error: {e}")
-                    continue
-            return
+                    print(f"TRACE: SSE Translation Error: {e}")
+                    continue            
+            # Close any remaining active tool blocks
+            if active_tools:
+                for idx in active_tools:
+                    yield anthropic_stop_block(active_tools[idx])
+                return
 
         return StreamingResponse(anthropic_stream(), media_type="text/event-stream")
 
@@ -264,8 +366,11 @@ async def messages(
     
     tool_calls = message.get("tool_calls")
     if tool_calls:
+        print(f"TRACE: Non-Stream: Detected OpenAI tool calls: {tool_calls}") 
         for tc in tool_calls:
-            content_blocks.append(translate_openai_tool_to_anthropic(tc))
+            translated = translate_openai_tool_to_anthropic(tc)
+            print(f"TRACE: Non-Stream: Translated to Anthropic block: {translated}") 
+            content_blocks.append(translated)
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:12]}",
@@ -346,7 +451,7 @@ async def update_conversation_memory(
 @anthropic_router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def catch_all(request: Request, path: str):
     """Catch-all route to log any unexpected requests from the client."""
-    print(f"DEBUG: [Catch-all] {request.method} /{path}")
+    print(f"TRACE: [Catch-all] {request.method} /{path}")
     from fastapi.responses import JSONResponse
     return JSONResponse(
         content={"error": "Endpoint not implemented in harness", "path": path},

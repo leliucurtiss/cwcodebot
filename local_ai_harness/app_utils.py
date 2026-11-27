@@ -65,4 +65,4 @@ def print_messages_length(messages, label):
         total_char_size += message_size
 
     # Print Total requests total character size
-    print(f"INFO: Total {label}s: {len(messages)} with {total_char_size} chars")
+    # print(f"INFO: Total {label}s: {len(messages)} with {total_char_size} chars")

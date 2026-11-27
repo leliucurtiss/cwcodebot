@@ -60,7 +60,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
     app.state.session_manager = session_manager
     app.state.memory_manager = memory_manager
     app.state.gateway = maas
- 
+    app.state.logger = logger
     # Specific routes are defined below.
 
 
@@ -169,7 +169,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
         payload["model"] = req.model or cfg.maas.default_model
         payload["max_tokens"] = cfg.context.model_context_max
         payload["messages"] = built_messages
-        # print(f"DEBUG: Payload keys: {list(payload.keys())}")
+        # print(f"TRACE: Payload keys: {list(payload.keys())}")
       
         if req.stream:
             # --- DIAGNOSTIC LOGGING START ---
@@ -177,7 +177,7 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             params = {k: v for k, v in payload.items() if k != 'messages' and k != 'model'}
             paramSize = sum(len(str(v)) for v in params.values())
             print(f"INFO: Param total:{paramSize} chars")
-            # print(f" ___ DEBUG: IDE Param total:{params}")
+            # print(f" ___ TRACE: IDE Param total:{params}")
 
             total_payload_size = len(json.dumps(payload))
             print(f"INFO:   Total payload size: {total_payload_size} characters")
