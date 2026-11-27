@@ -1,7 +1,10 @@
 import json
+import asyncio
+import httpx
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from local_ai_harness.app import _translate_tool_call, create_app
@@ -97,6 +100,68 @@ class ToolCaptureGateway(FakeGateway):
         }
 
 
+class VerifyingGateway(FakeGateway):
+    async def verify_upstream(self) -> dict[str, Any]:
+        return {"response_id": "gen-1", "content_present": True}
+
+
+def test_gateway_retries_transient_rate_limit(monkeypatch) -> None:
+    from local_ai_harness.gateway import MaasGateway
+
+    attempts = 0
+
+    async def fake_post(self, url, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return httpx.Response(
+                429,
+                request=httpx.Request("POST", url),
+                json={"error": {"message": "temporary"}},
+            )
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", url),
+            json={"choices": [{"message": {"content": "OK"}}]},
+        )
+
+    async def no_delay(self, response, attempt):
+        return None
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    monkeypatch.setattr(MaasGateway, "_retry_delay", no_delay)
+    gateway = MaasGateway(
+        MaasConfig(
+            base_url="https://provider.test/v1",
+            api_key="test",
+            default_model="test",
+        )
+    )
+
+    response = asyncio.run(gateway.chat_completion({"model": "test", "messages": []}))
+
+    assert attempts == 3
+    assert response["choices"][0]["message"]["content"] == "OK"
+
+
+def test_upstream_error_includes_provider_metadata() -> None:
+    from local_ai_harness.gateway import MaasGateway, MaasUpstreamError
+
+    response = httpx.Response(
+        429,
+        request=httpx.Request("POST", "https://provider.test"),
+        json={
+            "error": {
+                "message": "Provider returned error",
+                "metadata": {"raw": "temporary shared-pool rate limit"},
+            }
+        },
+    )
+
+    with pytest.raises(MaasUpstreamError, match="shared-pool rate limit"):
+        MaasGateway._raise_for_status(response)
+
+
 def make_config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         server=ServerConfig(),
@@ -190,6 +255,16 @@ def test_openai_tool_history_and_definitions_are_forwarded(tmp_path: Path) -> No
     assert gateway.payload["tools"][0]["function"]["name"] == "read_file"
     assert gateway.payload["messages"][0]["tool_calls"][0]["id"] == "call_1"
     assert gateway.payload["messages"][1]["tool_call_id"] == "call_1"
+
+
+def test_upstream_health_verifies_chat_authentication(tmp_path: Path) -> None:
+    app = create_app(config=make_config(tmp_path), gateway=VerifyingGateway())  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.get("/health/upstream")
+
+    assert response.status_code == 200
+    assert response.json()["authentication_verified"] is True
+    assert response.json()["response_id"] == "gen-1"
 
 
 def test_non_stream_text_tool_call_is_translated(tmp_path: Path) -> None:

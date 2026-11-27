@@ -5,6 +5,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from local_ai_harness.app import create_app
+from local_ai_harness.gateway import MaasUpstreamError
 from local_ai_harness.config import (
     AppConfig,
     ContextConfig,
@@ -75,6 +76,12 @@ class StreamingGateway(CaptureGateway):
             yield stream[size : size + 11].encode()
 
 
+class FailingStreamingGateway(CaptureGateway):
+    async def stream_chat_completion(self, payload: dict[str, Any]):
+        raise MaasUpstreamError(429, "Provider rate limit")
+        yield b""
+
+
 def test_anthropic_tools_messages_and_response_round_trip(tmp_path: Path) -> None:
     gateway = CaptureGateway()
     app = create_app(config=make_config(tmp_path), gateway=gateway)  # type: ignore[arg-type]
@@ -125,6 +132,7 @@ def test_anthropic_tools_messages_and_response_round_trip(tmp_path: Path) -> Non
     assert response.status_code == 200
     payload = gateway.payloads[0]
     assert payload["tools"][0]["function"]["name"] == "read_file"
+    assert payload["model"] == "gemma"
     assert payload["tools"][0]["function"]["parameters"]["required"] == ["path"]
     assert payload["tool_choice"] == {
         "type": "function",
@@ -183,3 +191,38 @@ def test_anthropic_stream_translates_fragmented_native_tool_call(tmp_path: Path)
     assert deltas[0]["delta"]["type"] == "input_json_delta"
     assert json.loads(deltas[0]["delta"]["partial_json"]) == {"path": "README.md"}
     assert message_deltas[0]["delta"]["stop_reason"] == "tool_use"
+
+
+def test_anthropic_stream_reports_upstream_failure_as_error_event(tmp_path: Path) -> None:
+    gateway = FailingStreamingGateway()
+    app = create_app(config=make_config(tmp_path), gateway=gateway)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "max_tokens": 128,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert "event: error" in response.text
+    assert "Provider rate limit" in response.text
+
+
+def test_anthropic_claude_model_is_mapped_to_configured_maas_model(tmp_path: Path) -> None:
+    gateway = CaptureGateway()
+    app = create_app(config=make_config(tmp_path), gateway=gateway)  # type: ignore[arg-type]
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 200
+    assert gateway.payloads[0]["model"] == "gemma"

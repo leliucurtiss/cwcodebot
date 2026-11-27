@@ -11,18 +11,39 @@ import yaml
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
 
 
-def _expand_env(value: Any) -> Any:
+def _load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[name] = value
+    return values
+
+
+def _expand_env(value: Any, environment: dict[str, str]) -> Any:
     if isinstance(value, str):
         def repl(match: re.Match[str]) -> str:
             name = match.group(1)
             default = match.group(2)
-            return os.getenv(name, default or "")
+            return environment.get(name, default or "")
 
         return _ENV_PATTERN.sub(repl, value)
     if isinstance(value, dict):
-        return {k: _expand_env(v) for k, v in value.items()}
+        return {k: _expand_env(v, environment) for k, v in value.items()}
     if isinstance(value, list):
-        return [_expand_env(v) for v in value]
+        return [_expand_env(v, environment) for v in value]
     return value
 
 @dataclass(frozen=True)
@@ -67,6 +88,7 @@ class AppConfig:
 
 def load_config(path: str | Path | None = None) -> AppConfig:
     config_path = Path(path or os.getenv("HARNESS_CONFIG", "config.yaml"))
+    environment = {**_load_dotenv(config_path.parent / ".env"), **os.environ}
     if not config_path.exists():
         example = Path("config.example.yaml")
         if example.exists():
@@ -75,7 +97,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise FileNotFoundError("Missing config.yaml and config.example.yaml")
 
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    data = _expand_env(raw)
+    data = _expand_env(raw, environment)
 
     server = data.get("server", {})
     maas = data.get("maas", {})
@@ -87,6 +109,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     if not base_url:
         raise ValueError("maas.base_url is required")
     api_key = str(maas.get("api_key", "")).strip()
+    if len(api_key) >= 2 and api_key[0] == api_key[-1] and api_key[0] in {"'", '"'}:
+        api_key = api_key[1:-1].strip()
     if api_key.lower().startswith("bearer "):
         api_key = api_key[7:].strip()
 

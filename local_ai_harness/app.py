@@ -96,6 +96,22 @@ def create_app(config_path: str | None = None, config: AppConfig | None = None, 
             "safe_input_budget": cfg.context.safe_input_budget,
         }
 
+    @app.get("/health/upstream")
+    async def upstream_health() -> dict[str, Any]:
+        if not cfg.maas.api_key:
+            raise HTTPException(
+                status_code=503,
+                detail="maas.api_key is empty; OPENROUTER_API_KEY was not inherited by this server process",
+            )
+        verification = await maas.verify_upstream()
+        return {
+            "status": "ok",
+            "base_url": cfg.maas.base_url,
+            "configured_model": cfg.maas.default_model,
+            "authentication_verified": True,
+            **verification,
+        }
+
     @app.get("/v1/models")
     async def models() -> dict[str, Any]:
         return await maas.list_models()

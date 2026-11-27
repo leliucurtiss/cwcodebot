@@ -17,6 +17,7 @@ from .models import (
 )
 
 from .app_utils import prepare_chat_context
+from .gateway import MaasUpstreamError
 from .tools_helpers import (
     translate_openai_tool_to_anthropic,
     translate_anthropic_to_openai_tools,
@@ -179,7 +180,7 @@ async def messages(
 
     # 3. Build payload for MAAS (OpenAI format).
     payload = {
-        "model": req.model or cfg.maas.default_model,
+        "model": cfg.maas.default_model,
         "messages": built_messages,
         "max_tokens": req.max_tokens or cfg.context.model_context_max,
         "stream": req.stream,
@@ -227,30 +228,42 @@ async def messages(
                 f"data: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': payload['model'], 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
             ).encode()
 
-            async for chunk in maas.stream_chat_completion(payload):
-                for event in decoder.feed(chunk):
-                    if event == "[DONE]":
-                        continue
-                    try:
-                        choice = json.loads(event).get("choices", [{}])[0]
-                    except (json.JSONDecodeError, IndexError):
-                        logger.error("Ignoring invalid OpenAI SSE event")
-                        continue
-                    delta = choice.get("delta", {})
-                    if isinstance(delta.get("reasoning_content"), str):
-                        text_buffer += delta["reasoning_content"]
-                    if isinstance(delta.get("content"), str):
-                        text_buffer += delta["content"]
-                    for tool_call in delta.get("tool_calls") or []:
-                        index = int(tool_call.get("index", len(native_tools)))
-                        active = native_tools.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                        if tool_call.get("id"):
-                            active["id"] += str(tool_call["id"])
-                        function = tool_call.get("function") or {}
-                        if function.get("name"):
-                            active["name"] += str(function["name"])
-                        if function.get("arguments"):
-                            active["arguments"] += str(function["arguments"])
+            try:
+                async for chunk in maas.stream_chat_completion(payload):
+                    for event in decoder.feed(chunk):
+                        if event == "[DONE]":
+                            continue
+                        try:
+                            choice = json.loads(event).get("choices", [{}])[0]
+                        except (json.JSONDecodeError, IndexError):
+                            logger.error("Ignoring invalid OpenAI SSE event")
+                            continue
+                        delta = choice.get("delta", {})
+                        if isinstance(delta.get("reasoning_content"), str):
+                            text_buffer += delta["reasoning_content"]
+                        if isinstance(delta.get("content"), str):
+                            text_buffer += delta["content"]
+                        for tool_call in delta.get("tool_calls") or []:
+                            index = int(tool_call.get("index", len(native_tools)))
+                            active = native_tools.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                            if tool_call.get("id"):
+                                active["id"] += str(tool_call["id"])
+                            function = tool_call.get("function") or {}
+                            if function.get("name"):
+                                active["name"] += str(function["name"])
+                            if function.get("arguments"):
+                                active["arguments"] += str(function["arguments"])
+            except MaasUpstreamError as exc:
+                logger.error("MaaS streaming error HTTP %s: %s", exc.status_code, exc.detail)
+                error = {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"MaaS upstream returned HTTP {exc.status_code}: {exc.detail}",
+                    },
+                }
+                yield f"event: error\ndata: {json.dumps(error)}\n\n".encode()
+                return
 
             tools: list[dict[str, Any]] = []
             cleaned_text = text_buffer
